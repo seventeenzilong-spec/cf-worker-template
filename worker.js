@@ -290,7 +290,7 @@ async function detectBotAdvanced(request, ip, env) {
 
   // Instagram bot (90 points)
   const isInstagramBot = userAgent.includes('instagrambot') ||
-                         userAgent.includes('instagram') && userAgent.includes('bot');
+                         (userAgent.includes('instagram') && userAgent.includes('bot'));
   
   if (isInstagramBot) {
     score += 90;
@@ -351,12 +351,13 @@ async function detectBotAdvanced(request, ip, env) {
     userAgent.includes(tool.toLowerCase())
   );
 
+  let hasBotKeywords = false;
   if (!isLegitAutomation) {
-    const hasBotKeywords = userAgent.includes('bot') || 
-                           userAgent.includes('crawler') || 
-                           userAgent.includes('spider') ||
-                           userAgent.includes('scraper') ||
-                           userAgent.includes('preview');
+    hasBotKeywords = userAgent.includes('bot') || 
+                     userAgent.includes('crawler') || 
+                     userAgent.includes('spider') ||
+                     userAgent.includes('scraper') ||
+                     userAgent.includes('preview');
     
     if (hasBotKeywords) {
       score += 40;
@@ -750,8 +751,13 @@ async function handleSaveLink(request, env) {
 // HTML GENERATORS
 // ============================================
 
+/**
+ * Generate minimal preview for default mode
+ * UPDATED: Title menggunakan domain saja (stealth mode untuk anti-spam detection)
+ */
 async function generateMinimalPreview(request, path) {
-  const canonicalUrl = `${new URL(request.url).origin}/${path}`;
+  const url = new URL(request.url);
+  const domain = url.hostname; // Domain saja untuk stealth
   
   return `<!DOCTYPE html>
 <html lang="id">
@@ -759,7 +765,11 @@ async function generateMinimalPreview(request, path) {
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <meta name="robots" content="noindex, nofollow" />
-<title>Redirecting...</title>
+<title>${domain}</title>
+<meta property="og:title" content="${domain}" />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="${url.origin}/${path}" />
+<meta name="twitter:title" content="${domain}" />
 <style>
 body {
   margin: 0;
@@ -798,7 +808,7 @@ h1 {
 <body>
   <div class="container">
     <div class="spinner"></div>
-    <h1>Redirecting...</h1>
+    <h1>${domain}</h1>
   </div>
 </body>
 </html>`;
