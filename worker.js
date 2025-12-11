@@ -1,33 +1,3 @@
-/**
- * Edge Worker (worker.js) - OPTIMIZED VERSION FOR AFFILIATE
- * 
- * Cloudflare Worker untuk handling public traffic at the edge.
- * Optimized untuk minimize false positive & maximize Meta bot detection.
- * 
- * CRITICAL REQUIREMENTS:
- * - FALSE POSITIVE < 1% (human traffic harus lolos = $$$ revenue)
- * - FALSE NEGATIVE < 5% (Meta bot harus ketangkep = account safety)
- * 
- * ENV VARIABLES (set via cf-api injection atau wrangler.toml):
- * - TARGET_URL: Default redirect URL for human visitors
- * - SECRET_KEY: Authentication key for internal API
- * 
- * KV NAMESPACE:
- * - LINK_STORAGE: Stores OG metadata, caption, comment, hit counter
- * 
- * OPTIMIZATIONS:
- * - Weighted scoring system (reduce false positive)
- * - IPv6 support for Meta ranges
- * - Enhanced Threads/Instagram detection
- * - Behavioral analysis
- * - Fallback detection mechanisms
- * - Analytics logging for continuous improvement
- */
-
-// ============================================
-// CONSTANTS
-// ============================================
-
 const TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 const MAX_PATH_LENGTH = 100;
 const PATH_PATTERN = /^[a-zA-Z0-9_-]+$/;
@@ -196,17 +166,11 @@ async function handleRequest(request, env, ctx) {
   console.log(`[Detection] Bot: ${isBot}, Score: ${score}, Confidence: ${confidence}, Reasons: ${reasons.join(', ')}`);
   
   if (isBot) {
-    console.log(`[BotDetected] Serving preview for: ${path} (Score: ${score}, Mode: ${linkData.mode})`);
+    console.log(`[BotDetected] Serving preview for: ${path} (Score: ${score})`);
     
-    // FIX: Improved mode checking - use og_preview or custom for dynamic OG, default for minimal
-    const useCustomOG = linkData.mode === 'og_preview' || linkData.mode === 'custom';
-    const hasOgMeta = linkData.ogMeta && (linkData.ogMeta.image || linkData.ogMeta.title);
-    
-    console.log(`[Preview] useCustomOG: ${useCustomOG}, hasOgMeta: ${hasOgMeta}`);
-    
-    const previewContent = (useCustomOG && hasOgMeta)
-      ? await generateSafePreview(request, linkData, path)
-      : await generateMinimalPreview(request, path);
+    const previewContent = linkData.mode === 'default' 
+      ? await generateMinimalPreview(request, path)
+      : await generateSafePreview(request, linkData, path);
 
     return new Response(previewContent, {
       headers: {
@@ -215,7 +179,6 @@ async function handleRequest(request, env, ctx) {
           'Cache-Control': 'public, max-age=3600',
           'X-Robots-Tag': 'nofollow, noarchive',
           'X-Bot-Score': score.toString(),
-          'X-Preview-Type': (useCustomOG && hasOgMeta) ? 'custom-og' : 'minimal',
         })
       },
     });
@@ -725,16 +688,13 @@ async function handleSaveLink(request, env) {
         mode: mode || 'default'
       };
 
-      // FIX: Accept both 'og_preview' and 'custom' modes for backward compatibility
-      if ((mode === 'og_preview' || mode === 'custom') && ogMeta) {
+      if (mode === 'og_preview' && ogMeta) {
         linkData.ogMeta = {
           image: ogMeta.image || '',
           title: ogMeta.title || '',
           description: ogMeta.description || '',
           canonical: ogMeta.canonical || ''
         };
-        // Normalize mode to 'og_preview' for consistent rendering
-        linkData.mode = 'og_preview';
       }
 
       return env.LINK_STORAGE.put(`link:${path}`, JSON.stringify(linkData), {
@@ -761,9 +721,7 @@ async function handleSaveLink(request, env) {
 // ============================================
 
 async function generateMinimalPreview(request, path) {
-  const url = new URL(request.url);
-  const canonicalUrl = `${url.origin}/${path}`;
-  const domainName = url.hostname.replace(/^www\./, '');
+  const canonicalUrl = `${new URL(request.url).origin}/${path}`;
   
   return `<!DOCTYPE html>
 <html lang="id">
@@ -771,19 +729,7 @@ async function generateMinimalPreview(request, path) {
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <meta name="robots" content="noindex, nofollow" />
-<title>${domainName}</title>
-
-<!-- Open Graph / Facebook -->
-<meta property="og:type" content="website" />
-<meta property="og:url" content="${canonicalUrl}" />
-<meta property="og:title" content="${domainName}" />
-<meta property="og:site_name" content="${domainName}" />
-
-<!-- Twitter -->
-<meta name="twitter:card" content="summary" />
-<meta name="twitter:url" content="${canonicalUrl}" />
-<meta name="twitter:title" content="${domainName}" />
-
+<title>Redirecting...</title>
 <style>
 body {
   margin: 0;
@@ -793,37 +739,36 @@ body {
   align-items: center;
   justify-content: center;
   min-height: 100vh;
-  background: #f5f5f5;
-  color: #333;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
 }
 .container {
   text-align: center;
   padding: 40px;
 }
 .spinner {
-  width: 40px;
-  height: 40px;
-  border: 3px solid #e0e0e0;
-  border-top-color: #333;
+  width: 50px;
+  height: 50px;
+  border: 5px solid rgba(255,255,255,0.3);
+  border-top-color: white;
   border-radius: 50%;
   animation: spin 1s linear infinite;
-  margin: 0 auto 16px;
+  margin: 0 auto 20px;
 }
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
 h1 {
-  font-size: 18px;
-  font-weight: 500;
+  font-size: 24px;
+  font-weight: 600;
   margin: 0;
-  color: #666;
 }
 </style>
 </head>
 <body>
   <div class="container">
     <div class="spinner"></div>
-    <h1>${domainName}</h1>
+    <h1>Redirecting...</h1>
   </div>
 </body>
 </html>`;
