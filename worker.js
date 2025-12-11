@@ -34,6 +34,16 @@ const PATH_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const RATE_LIMIT_WINDOW = 3600; // 1 hour
 const RATE_LIMIT_MAX = 100;
 
+// Monitoring constants
+const METRICS_TTL = 24 * 60 * 60; // 24 hours
+const ALERT_COOLDOWN = 300; // 5 minutes between same alerts
+const SUSPICIOUS_THRESHOLD = {
+  HIGH_FP_RATE: 5,        // >5% false positive rate
+  HIGH_FN_RATE: 10,       // >10% false negative rate
+  BURST_REQUESTS: 50,     // >50 requests per minute from same pattern
+  UNUSUAL_SCORE_DIST: 30, // >30% in gray zone (40-60)
+};
+
 // Bot detection threshold (0-100 scale)
 const BOT_THRESHOLD_DEFINITE = 80;  // >= 80: Definitely bot
 const BOT_THRESHOLD_LIKELY = 60;    // 60-79: Likely bot
@@ -133,6 +143,27 @@ async function handleRequest(request, env, ctx) {
   if (request.method === 'POST' && path === 'api/save-link') {
     console.log('[API] Handling save-link request');
     return handleSaveLink(request, env);
+  }
+
+  // Monitoring API endpoints
+  if (path === 'api/metrics') {
+    return handleGetMetrics(request, env);
+  }
+  
+  if (path === 'api/metrics/summary') {
+    return handleGetMetricsSummary(request, env);
+  }
+  
+  if (path === 'api/alerts') {
+    return handleGetAlerts(request, env);
+  }
+  
+  if (request.method === 'POST' && path === 'api/alerts/test') {
+    return handleTestAlert(request, env);
+  }
+  
+  if (path === 'api/worker-limits') {
+    return handleWorkerLimits(request, env);
   }
 
   // Health check endpoint
@@ -575,8 +606,11 @@ function normalizeIPv6(ip) {
 
 async function logDetection(path, detectionResult, env) {
   try {
-    const logKey = `analytics:${Date.now()}:${Math.random().toString(36).substring(7)}`;
+    const now = Date.now();
+    const hour = new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
     
+    // Store individual log
+    const logKey = `analytics:${now}:${Math.random().toString(36).substring(7)}`;
     const logData = {
       timestamp: new Date().toISOString(),
       path: path,
@@ -588,12 +622,498 @@ async function logDetection(path, detectionResult, env) {
       ip: detectionResult.ip,
     };
 
-    // Store for 7 days for analysis
     await env.LINK_STORAGE.put(logKey, JSON.stringify(logData), {
       expirationTtl: 7 * 24 * 60 * 60
     });
+
+    // Update hourly metrics for monitoring
+    await updateHourlyMetrics(hour, detectionResult, env);
+    
+    // Check for suspicious patterns
+    await checkSuspiciousPatterns(detectionResult, env);
+    
   } catch (e) {
     console.error('Logging error:', e);
+  }
+}
+
+// ============================================
+// MONITORING: METRICS AGGREGATION
+// ============================================
+
+async function updateHourlyMetrics(hour, detection, env) {
+  const metricsKey = `metrics:hourly:${hour}`;
+  
+  try {
+    const existing = await env.LINK_STORAGE.get(metricsKey);
+    let metrics = existing ? JSON.parse(existing) : {
+      hour: hour,
+      totalRequests: 0,
+      botDetected: 0,
+      humanPassed: 0,
+      scoreDistribution: { low: 0, mid: 0, high: 0, veryHigh: 0 },
+      confidenceBreakdown: {},
+      topReasons: {},
+      grayZoneCount: 0,
+    };
+
+    metrics.totalRequests++;
+    
+    if (detection.isBot) {
+      metrics.botDetected++;
+    } else {
+      metrics.humanPassed++;
+    }
+
+    // Score distribution
+    if (detection.score < 40) metrics.scoreDistribution.low++;
+    else if (detection.score < 60) metrics.scoreDistribution.mid++;
+    else if (detection.score < 80) metrics.scoreDistribution.high++;
+    else metrics.scoreDistribution.veryHigh++;
+
+    // Gray zone tracking
+    if (detection.score >= 40 && detection.score < 60) {
+      metrics.grayZoneCount++;
+    }
+
+    // Confidence breakdown
+    const conf = detection.confidence || 'unknown';
+    metrics.confidenceBreakdown[conf] = (metrics.confidenceBreakdown[conf] || 0) + 1;
+
+    // Top reasons
+    for (const reason of detection.reasons) {
+      metrics.topReasons[reason] = (metrics.topReasons[reason] || 0) + 1;
+    }
+
+    await env.LINK_STORAGE.put(metricsKey, JSON.stringify(metrics), {
+      expirationTtl: METRICS_TTL
+    });
+  } catch (e) {
+    console.error('Metrics update error:', e);
+  }
+}
+
+async function checkSuspiciousPatterns(detection, env) {
+  const alerts = [];
+  const now = Date.now();
+  
+  try {
+    // Get current metrics for analysis
+    const hour = new Date().toISOString().slice(0, 13);
+    const metricsKey = `metrics:hourly:${hour}`;
+    const existing = await env.LINK_STORAGE.get(metricsKey);
+    
+    if (!existing) return;
+    
+    const metrics = JSON.parse(existing);
+    
+    // Check gray zone rate (potential FP/FN indicator)
+    if (metrics.totalRequests > 20) {
+      const grayZoneRate = (metrics.grayZoneCount / metrics.totalRequests) * 100;
+      
+      if (grayZoneRate > SUSPICIOUS_THRESHOLD.UNUSUAL_SCORE_DIST) {
+        alerts.push({
+          type: 'HIGH_GRAY_ZONE',
+          level: 'warning',
+          message: `High gray zone rate: ${grayZoneRate.toFixed(1)}% of requests in uncertain range`,
+          value: grayZoneRate,
+          threshold: SUSPICIOUS_THRESHOLD.UNUSUAL_SCORE_DIST
+        });
+      }
+    }
+
+    // Check for sudden traffic spike
+    const prevHour = new Date(Date.now() - 3600000).toISOString().slice(0, 13);
+    const prevMetrics = await env.LINK_STORAGE.get(`metrics:hourly:${prevHour}`);
+    
+    if (prevMetrics) {
+      const prev = JSON.parse(prevMetrics);
+      const spikeRatio = metrics.totalRequests / (prev.totalRequests || 1);
+      
+      if (spikeRatio > 5 && metrics.totalRequests > 100) {
+        alerts.push({
+          type: 'TRAFFIC_SPIKE',
+          level: 'warning',
+          message: `Traffic spike detected: ${spikeRatio.toFixed(1)}x increase from previous hour`,
+          value: spikeRatio,
+          current: metrics.totalRequests,
+          previous: prev.totalRequests
+        });
+      }
+    }
+
+    // Store alerts if any
+    for (const alert of alerts) {
+      await storeAlert(alert, env);
+    }
+    
+  } catch (e) {
+    console.error('Pattern check error:', e);
+  }
+}
+
+async function storeAlert(alert, env) {
+  const alertKey = `alert:${Date.now()}:${alert.type}`;
+  const cooldownKey = `alert_cooldown:${alert.type}`;
+  
+  try {
+    // Check cooldown
+    const lastAlert = await env.LINK_STORAGE.get(cooldownKey);
+    if (lastAlert) return; // Still in cooldown
+    
+    // Store alert
+    const alertData = {
+      ...alert,
+      timestamp: new Date().toISOString(),
+      id: alertKey
+    };
+    
+    await env.LINK_STORAGE.put(alertKey, JSON.stringify(alertData), {
+      expirationTtl: 7 * 24 * 60 * 60 // Keep for 7 days
+    });
+    
+    // Set cooldown
+    await env.LINK_STORAGE.put(cooldownKey, '1', {
+      expirationTtl: ALERT_COOLDOWN
+    });
+    
+    // Send webhook if configured
+    await sendAlertWebhook(alertData, env);
+    
+  } catch (e) {
+    console.error('Store alert error:', e);
+  }
+}
+
+async function sendAlertWebhook(alert, env) {
+  const webhookUrl = env.ALERT_WEBHOOK_URL;
+  if (!webhookUrl) return;
+  
+  try {
+    const isDiscord = webhookUrl.includes('discord.com');
+    const isTelegram = webhookUrl.includes('api.telegram.org');
+    
+    let payload;
+    
+    if (isDiscord) {
+      payload = {
+        embeds: [{
+          title: `🚨 ${alert.type}`,
+          description: alert.message,
+          color: alert.level === 'error' ? 15158332 : 16776960,
+          timestamp: alert.timestamp,
+          fields: [
+            { name: 'Level', value: alert.level, inline: true },
+            { name: 'Value', value: String(alert.value), inline: true }
+          ]
+        }]
+      };
+    } else if (isTelegram) {
+      const chatId = env.TELEGRAM_CHAT_ID;
+      payload = {
+        chat_id: chatId,
+        text: `🚨 *${alert.type}*\n\n${alert.message}\n\nLevel: ${alert.level}\nTime: ${alert.timestamp}`,
+        parse_mode: 'Markdown'
+      };
+    } else {
+      // Generic webhook
+      payload = alert;
+    }
+    
+    await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    
+  } catch (e) {
+    console.error('Webhook error:', e);
+  }
+}
+
+// ============================================
+// MONITORING API HANDLERS
+// ============================================
+
+async function handleGetMetrics(request, env) {
+  const authHeader = request.headers.get('Authorization');
+  const SECRET_KEY = env.SECRET_KEY || (typeof INJECTED_SECRET_KEY !== 'undefined' ? INJECTED_SECRET_KEY : '');
+
+  if (!SECRET_KEY || authHeader !== `Bearer ${SECRET_KEY}`) {
+    return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+
+  try {
+    // Get last 24 hours of metrics
+    const metrics = [];
+    const now = new Date();
+    
+    for (let i = 0; i < 24; i++) {
+      const hour = new Date(now - i * 3600000).toISOString().slice(0, 13);
+      const data = await env.LINK_STORAGE.get(`metrics:hourly:${hour}`);
+      if (data) {
+        metrics.push(JSON.parse(data));
+      }
+    }
+
+    return new Response(JSON.stringify({ 
+      success: true, 
+      metrics: metrics.reverse(),
+      generated: new Date().toISOString()
+    }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+    
+  } catch (e) {
+    console.error('Get metrics error:', e);
+    return new Response(JSON.stringify({ error: 'Failed to get metrics' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+}
+
+async function handleGetMetricsSummary(request, env) {
+  const authHeader = request.headers.get('Authorization');
+  const SECRET_KEY = env.SECRET_KEY || (typeof INJECTED_SECRET_KEY !== 'undefined' ? INJECTED_SECRET_KEY : '');
+
+  if (!SECRET_KEY || authHeader !== `Bearer ${SECRET_KEY}`) {
+    return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+
+  try {
+    // Aggregate last 24 hours
+    let summary = {
+      totalRequests: 0,
+      botDetected: 0,
+      humanPassed: 0,
+      avgScore: 0,
+      scoreDistribution: { low: 0, mid: 0, high: 0, veryHigh: 0 },
+      grayZoneRate: 0,
+      topReasons: {},
+      confidenceBreakdown: {},
+      hourlyTrend: []
+    };
+    
+    const now = new Date();
+    let totalScoreWeighted = 0;
+    let grayZoneTotal = 0;
+    
+    for (let i = 0; i < 24; i++) {
+      const hour = new Date(now - i * 3600000).toISOString().slice(0, 13);
+      const data = await env.LINK_STORAGE.get(`metrics:hourly:${hour}`);
+      
+      if (data) {
+        const m = JSON.parse(data);
+        summary.totalRequests += m.totalRequests || 0;
+        summary.botDetected += m.botDetected || 0;
+        summary.humanPassed += m.humanPassed || 0;
+        grayZoneTotal += m.grayZoneCount || 0;
+        
+        summary.scoreDistribution.low += m.scoreDistribution?.low || 0;
+        summary.scoreDistribution.mid += m.scoreDistribution?.mid || 0;
+        summary.scoreDistribution.high += m.scoreDistribution?.high || 0;
+        summary.scoreDistribution.veryHigh += m.scoreDistribution?.veryHigh || 0;
+        
+        // Merge top reasons
+        for (const [reason, count] of Object.entries(m.topReasons || {})) {
+          summary.topReasons[reason] = (summary.topReasons[reason] || 0) + count;
+        }
+        
+        // Merge confidence
+        for (const [conf, count] of Object.entries(m.confidenceBreakdown || {})) {
+          summary.confidenceBreakdown[conf] = (summary.confidenceBreakdown[conf] || 0) + count;
+        }
+        
+        summary.hourlyTrend.push({
+          hour: m.hour,
+          requests: m.totalRequests,
+          bots: m.botDetected,
+          humans: m.humanPassed
+        });
+      }
+    }
+    
+    // Calculate rates
+    if (summary.totalRequests > 0) {
+      summary.botRate = ((summary.botDetected / summary.totalRequests) * 100).toFixed(2);
+      summary.humanRate = ((summary.humanPassed / summary.totalRequests) * 100).toFixed(2);
+      summary.grayZoneRate = ((grayZoneTotal / summary.totalRequests) * 100).toFixed(2);
+    }
+    
+    // Sort top reasons
+    summary.topReasons = Object.entries(summary.topReasons)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .reduce((obj, [k, v]) => ({ ...obj, [k]: v }), {});
+    
+    summary.hourlyTrend.reverse();
+
+    return new Response(JSON.stringify({ 
+      success: true, 
+      summary,
+      generated: new Date().toISOString()
+    }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+    
+  } catch (e) {
+    console.error('Get summary error:', e);
+    return new Response(JSON.stringify({ error: 'Failed to get summary' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+}
+
+async function handleGetAlerts(request, env) {
+  const authHeader = request.headers.get('Authorization');
+  const SECRET_KEY = env.SECRET_KEY || (typeof INJECTED_SECRET_KEY !== 'undefined' ? INJECTED_SECRET_KEY : '');
+
+  if (!SECRET_KEY || authHeader !== `Bearer ${SECRET_KEY}`) {
+    return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+
+  try {
+    // List alerts from KV (last 7 days)
+    const alertList = await env.LINK_STORAGE.list({ prefix: 'alert:' });
+    const alerts = [];
+    
+    for (const key of alertList.keys.slice(0, 50)) { // Max 50 alerts
+      const data = await env.LINK_STORAGE.get(key.name);
+      if (data) {
+        alerts.push(JSON.parse(data));
+      }
+    }
+    
+    // Sort by timestamp descending
+    alerts.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+    return new Response(JSON.stringify({ 
+      success: true, 
+      alerts,
+      count: alerts.length
+    }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+    
+  } catch (e) {
+    console.error('Get alerts error:', e);
+    return new Response(JSON.stringify({ error: 'Failed to get alerts' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+}
+
+async function handleTestAlert(request, env) {
+  const authHeader = request.headers.get('Authorization');
+  const SECRET_KEY = env.SECRET_KEY || (typeof INJECTED_SECRET_KEY !== 'undefined' ? INJECTED_SECRET_KEY : '');
+
+  if (!SECRET_KEY || authHeader !== `Bearer ${SECRET_KEY}`) {
+    return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+
+  try {
+    const testAlert = {
+      type: 'TEST_ALERT',
+      level: 'info',
+      message: 'This is a test alert from the monitoring system',
+      value: 100,
+      timestamp: new Date().toISOString()
+    };
+    
+    await sendAlertWebhook(testAlert, env);
+    
+    return new Response(JSON.stringify({ 
+      success: true, 
+      message: 'Test alert sent',
+      webhookConfigured: !!env.ALERT_WEBHOOK_URL
+    }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+    
+  } catch (e) {
+    console.error('Test alert error:', e);
+    return new Response(JSON.stringify({ error: 'Failed to send test alert' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+}
+
+async function handleWorkerLimits(request, env) {
+  const authHeader = request.headers.get('Authorization');
+  const SECRET_KEY = env.SECRET_KEY || (typeof INJECTED_SECRET_KEY !== 'undefined' ? INJECTED_SECRET_KEY : '');
+
+  if (!SECRET_KEY || authHeader !== `Bearer ${SECRET_KEY}`) {
+    return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+
+  try {
+    // Estimate usage based on recent metrics
+    const hour = new Date().toISOString().slice(0, 13);
+    const metricsData = await env.LINK_STORAGE.get(`metrics:hourly:${hour}`);
+    
+    const currentHourRequests = metricsData ? JSON.parse(metricsData).totalRequests : 0;
+    
+    // Cloudflare Workers limits (free tier)
+    const limits = {
+      requestsPerDay: 100000,
+      cpuTimePerRequest: 10, // ms
+      kvReadsPerDay: 100000,
+      kvWritesPerDay: 1000,
+      estimatedDailyRequests: currentHourRequests * 24,
+      currentHourRequests,
+      warnings: []
+    };
+    
+    // Check if approaching limits
+    if (limits.estimatedDailyRequests > limits.requestsPerDay * 0.8) {
+      limits.warnings.push({
+        type: 'REQUEST_LIMIT',
+        message: `Approaching daily request limit: ~${limits.estimatedDailyRequests} estimated vs ${limits.requestsPerDay} limit`,
+        severity: 'warning'
+      });
+    }
+    
+    if (limits.estimatedDailyRequests > limits.kvWritesPerDay * 0.5) {
+      limits.warnings.push({
+        type: 'KV_WRITES',
+        message: `High KV write usage: metrics logging may hit limits`,
+        severity: 'info'
+      });
+    }
+
+    return new Response(JSON.stringify({ 
+      success: true, 
+      limits,
+      generated: new Date().toISOString()
+    }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+    
+  } catch (e) {
+    console.error('Worker limits error:', e);
+    return new Response(JSON.stringify({ error: 'Failed to get limits' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
   }
 }
 
