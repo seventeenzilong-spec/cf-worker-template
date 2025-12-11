@@ -1,16 +1,39 @@
+/**
+ * Edge Worker (worker.js) - ES Modules Format
+ * 
+ * Cloudflare Worker untuk handling public traffic at the edge.
+ * Deployed automatically by cf-api.js dengan injected ENV variables.
+ * 
+ * FILE INI ADALAH SINGLE SOURCE OF TRUTH untuk template worker.
+ * cf-api.js akan fetch file ini saat deploy (tidak ada duplikasi).
+ * 
+ * ENV VARIABLES (set via cf-api injection atau wrangler.toml):
+ * - TARGET_URL: Default redirect URL for human visitors
+ * - SECRET_KEY: Authentication key for internal API
+ * 
+ * KV NAMESPACE:
+ * - LINK_STORAGE: Stores OG metadata, caption, comment, hit counter
+ * 
+ * FEATURES:
+ * - Bot detection (Meta, Twitter, etc.) -> Returns OG preview page
+ * - Human detection -> 302 redirect to TARGET_URL
+ * - Internal API for saving link data (authenticated via SECRET_KEY)
+ * - Rate limiting
+ * - Click counter
+ */
+
+// ============================================
+// CONSTANTS
+// ============================================
+
 const TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 const MAX_PATH_LENGTH = 100;
 const PATH_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const RATE_LIMIT_WINDOW = 3600; // 1 hour
 const RATE_LIMIT_MAX = 100;
 
-// Bot detection threshold (0-100 scale)
-const BOT_THRESHOLD_DEFINITE = 80;  // >= 80: Definitely bot
-const BOT_THRESHOLD_LIKELY = 60;    // 60-79: Likely bot
-const HUMAN_THRESHOLD = 40;         // < 40: Likely human
-
-// Meta/Facebook IP ranges (IPv4 + IPv6)
-const META_IP_RANGES_V4 = [
+// Meta/Facebook IP ranges for bot detection
+const META_IP_RANGES = [
   '31.13.24.0/21', '31.13.64.0/18', '31.13.96.0/19',
   '66.220.144.0/20', '69.63.176.0/20', '69.171.224.0/19',
   '74.119.76.0/22', '102.132.96.0/20', '103.4.96.0/22',
@@ -18,54 +41,27 @@ const META_IP_RANGES_V4 = [
   '179.60.192.0/22', '185.60.216.0/22', '204.15.20.0/22',
   '199.16.156.0/22', '192.133.76.0/22',
   '18.194.0.0/15', '34.224.0.0/12',
+  '2a03:2880::/32', '2c0f:fb50::/32'
 ];
 
-const META_IP_RANGES_V6 = [
-  '2a03:2880::/32',  // Facebook primary
-  '2c0f:fb50::/32',  // Meta Africa
-  '2a03:2887::/32',  // Facebook secondary
-];
-
-// High-confidence Meta bot user agents
-const META_BOT_AGENTS = [
-  'facebookexternalhit',
-  'Facebot',
-  'facebookplatform',
-  'Meta-ExternalAgent',
-  'meta-externalhit',
-  'InstagramBot',
-  'ThreadsBot',
-  'ThreadsExternalHit',
-];
-
-// Other social media bots
-const OTHER_BOT_AGENTS = [
+// Known bot user agents
+const BOT_USER_AGENTS = [
+  'facebookexternalhit', 'Facebot', 'facebookplatform',
+  'Meta-ExternalAgent', 'meta-externalhit',
+  'InstagramBot', 'ThreadsBot', 'ThreadsExternalHit',
   'Twitterbot', 'Twitter',
   'WhatsApp', 'WhatsApp/', 'WA_Business',
   'LinkedInBot', 'linkedin',
   'Slackbot', 'TelegramBot', 'SkypeUriPreview',
   'Discordbot', 'redditbot', 'Applebot',
-  'ia_archiver', 'PinterestBot',
-];
-
-// Search engine bots (treat as bot for preview)
-const SEARCH_ENGINE_BOTS = [
-  'Googlebot', 'bingbot', 'Baiduspider', 'YandexBot',
-  'DuckDuckBot', 'Sogou', 'Exabot',
-];
-
-// Legitimate headless/automation tools (should NOT be treated as social bot)
-const LEGITIMATE_AUTOMATION = [
-  'Pingdom', 'UptimeRobot', 'StatusCake',
-  'GTmetrix', 'PageSpeed', 'Lighthouse',
-  'Selenium', 'Puppeteer', 'Playwright',
+  'ia_archiver', 'PinterestBot', 'Googlebot',
+  'bingbot', 'Baiduspider', 'YandexBot'
 ];
 
 // Trusted image CDN domains
 const TRUSTED_IMAGE_DOMAINS = [
   'cdn.', 'imgur.com', 'cloudinary.com', 'imagekit.io',
-  'imgix.net', 'cloudfront.net', 'b-cdn.', 'bunnycdn.com',
-  'grbto.net',
+  'imgix.net', 'cloudfront.net', 'b-cdn.', 'bunnycdn.com'
 ];
 
 const corsHeaders = {
@@ -97,19 +93,12 @@ async function handleRequest(request, env, ctx) {
   const userAgent = request.headers.get('User-Agent') || '';
   const path = url.pathname.substring(1);
 
-  console.log(`[Request] Path: ${path}, IP: ${clientIP}, UA: ${userAgent.substring(0, 60)}...`);
+  console.log(`[Request] Path: ${path}, IP: ${clientIP}, UA: ${userAgent.substring(0, 50)}...`);
 
   // Internal API endpoint for saving links
   if (request.method === 'POST' && path === 'api/save-link') {
     console.log('[API] Handling save-link request');
     return handleSaveLink(request, env);
-  }
-
-  // Health check endpoint
-  if (path === 'health' || path === 'ping') {
-    return new Response(JSON.stringify({ status: 'ok', service: 'link-generator' }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
   }
 
   // Root path or favicon
@@ -156,17 +145,11 @@ async function handleRequest(request, env, ctx) {
   // Update click counter asynchronously
   ctx.waitUntil(updateCounter(path, linkData, env));
 
-  // OPTIMIZED BOT DETECTION with scoring system
-  const detectionResult = await detectBotAdvanced(request, clientIP, env);
-  const { isBot, score, reasons, confidence } = detectionResult;
-
-  // Log detection for analytics
-  ctx.waitUntil(logDetection(path, detectionResult, env));
-
-  console.log(`[Detection] Bot: ${isBot}, Score: ${score}, Confidence: ${confidence}, Reasons: ${reasons.join(', ')}`);
+  // Bot detection
+  const isBot = await detectBot(request, clientIP);
   
   if (isBot) {
-    console.log(`[BotDetected] Serving preview for: ${path} (Score: ${score})`);
+    console.log(`[BotDetected] Serving preview for: ${path}`);
     
     const previewContent = linkData.mode === 'default' 
       ? await generateMinimalPreview(request, path)
@@ -177,310 +160,98 @@ async function handleRequest(request, env, ctx) {
         ...addSecurityHeaders({
           'Content-Type': 'text/html;charset=UTF-8',
           'Cache-Control': 'public, max-age=3600',
-          'X-Robots-Tag': 'nofollow, noarchive',
-          'X-Bot-Score': score.toString(),
+          'X-Robots-Tag': 'nofollow, noarchive'
         })
       },
     });
   }
 
   // Human visitor -> Redirect
+  // Gunakan env.TARGET_URL, dengan fallback ke INJECTED_TARGET_URL jika ada
   const targetUrl = linkData.target || env.TARGET_URL || (typeof INJECTED_TARGET_URL !== 'undefined' ? INJECTED_TARGET_URL : '');
   
   if (!isValidTargetUrl(targetUrl)) {
     return new Response('Invalid target URL', { status: 400 });
   }
 
-  console.log(`[HumanRedirect] Redirecting to: ${targetUrl} (Score: ${score})`);
+  console.log(`[HumanRedirect] Redirecting to: ${targetUrl}`);
   return Response.redirect(targetUrl, 302);
 }
 
 // ============================================
-// ADVANCED BOT DETECTION (OPTIMIZED)
+// BOT DETECTION
 // ============================================
 
-async function detectBotAdvanced(request, ip, env) {
+async function detectBot(request, ip) {
   const userAgent = (request.headers.get('User-Agent') || '').toLowerCase();
-  const referer = (request.headers.get('Referer') || '').toLowerCase();
   
-  let score = 0;
-  let reasons = [];
-  let confidence = 'unknown';
+  // Check known bot user agents
+  const isUserAgentBot = BOT_USER_AGENTS.some(bot =>
+    userAgent.includes(bot.toLowerCase())
+  );
+  
+  if (isUserAgentBot) {
+    console.log('[BotCheck] Detected via User-Agent');
+    return true;
+  }
 
-  // ==================================================
-  // TIER 1: HIGH CONFIDENCE SIGNALS (70-95 points)
-  // ==================================================
-
-  // Meta-specific headers (95 points) - HIGHEST confidence
+  // Check Meta/Facebook headers
   const xPurpose = request.headers.get('X-Purpose');
   const xFBEngine = request.headers.get('X-FB-HTTP-Engine');
-  const xIGAppID = request.headers.get('X-IG-App-ID');
-  const xFBFriendlyName = request.headers.get('X-FB-Friendly-Name');
   
-  if (xPurpose === 'preview') {
-    score += 95;
-    reasons.push('Meta X-Purpose header');
-    confidence = 'very-high';
+  if (xPurpose === 'preview' || xFBEngine === 'Liger') {
+    console.log('[BotCheck] Detected via Meta headers');
+    return true;
   }
+
+  // Check Meta IP ranges
+  if (ip && isIPInMetaRanges(ip)) {
+    console.log('[BotCheck] Detected via Meta IP range');
+    return true;
+  }
+
+  // Check for bot keywords in user agent
+  const hasBotKeywords = userAgent.includes('bot') || 
+                         userAgent.includes('crawler') || 
+                         userAgent.includes('spider') ||
+                         userAgent.includes('scraper');
   
-  if (xFBEngine === 'Liger') {
-    score += 95;
-    reasons.push('Meta FB-Engine header');
-    confidence = 'very-high';
-  }
-
-  if (xIGAppID || xFBFriendlyName) {
-    score += 90;
-    reasons.push('Instagram/Threads header');
-    confidence = 'very-high';
-  }
-
-  // Exact Meta bot user agent match (90 points)
-  const hasMetaBotUA = META_BOT_AGENTS.some(bot => 
-    userAgent.includes(bot.toLowerCase())
-  );
-  
-  if (hasMetaBotUA) {
-    score += 90;
-    reasons.push('Meta bot user-agent');
-    confidence = confidence === 'very-high' ? 'very-high' : 'high';
-  }
-
-  // Threads-specific detection (90 points)
-  const isThreadsBot = userAgent.includes('threadsbot') || 
-                       userAgent.includes('threadsexternalhit') ||
-                       userAgent.includes('barcelona') || // Threads codename
-                       referer.includes('threads.net');
-  
-  if (isThreadsBot) {
-    score += 90;
-    reasons.push('Threads crawler');
-    confidence = 'very-high';
-  }
-
-  // Instagram bot (90 points)
-  const isInstagramBot = userAgent.includes('instagrambot') ||
-                         userAgent.includes('instagram') && userAgent.includes('bot');
-  
-  if (isInstagramBot) {
-    score += 90;
-    reasons.push('Instagram bot');
-    confidence = 'very-high';
-  }
-
-  // Other social media bots (75 points)
-  const hasOtherSocialBot = OTHER_BOT_AGENTS.some(bot =>
-    userAgent.includes(bot.toLowerCase())
-  );
-  
-  if (hasOtherSocialBot) {
-    score += 75;
-    reasons.push('Social media bot');
-    confidence = confidence === 'unknown' ? 'high' : confidence;
-  }
-
-  // Search engine bots (70 points)
-  const isSearchBot = SEARCH_ENGINE_BOTS.some(bot =>
-    userAgent.includes(bot.toLowerCase())
-  );
-  
-  if (isSearchBot) {
-    score += 70;
-    reasons.push('Search engine bot');
-    confidence = confidence === 'unknown' ? 'high' : confidence;
-  }
-
-  // ==================================================
-  // TIER 2: MEDIUM CONFIDENCE SIGNALS (30-50 points)
-  // ==================================================
-
-  // Meta IP range (50 points for IPv4, 55 for IPv6)
-  // Note: Reduced from original because employees/VPN can be in range
-  if (ip) {
-    const ipVersion = ip.includes(':') ? 6 : 4;
-    const inMetaRange = ipVersion === 6 
-      ? isIPv6InMetaRanges(ip)
-      : isIPv4InMetaRanges(ip);
-    
-    if (inMetaRange) {
-      // Only add score if we have OTHER signals (prevent false positive)
-      if (reasons.length > 0) {
-        score += ipVersion === 6 ? 55 : 50;
-        reasons.push(`Meta IP range (IPv${ipVersion})`);
-      } else {
-        // IP alone is not enough - just note it
-        score += 20;
-        reasons.push(`Meta IP (low confidence)`);
-      }
-    }
-  }
-
-  // Generic bot keywords in UA (40 points)
-  // But only if NOT a legitimate automation tool
-  const isLegitAutomation = LEGITIMATE_AUTOMATION.some(tool =>
-    userAgent.includes(tool.toLowerCase())
-  );
-
-  if (!isLegitAutomation) {
-    const hasBotKeywords = userAgent.includes('bot') || 
-                           userAgent.includes('crawler') || 
-                           userAgent.includes('spider') ||
-                           userAgent.includes('scraper') ||
-                           userAgent.includes('preview');
-    
-    if (hasBotKeywords) {
-      score += 40;
-      reasons.push('Generic bot keywords');
-      confidence = confidence === 'unknown' ? 'medium' : confidence;
-    }
-  }
-
-  // Headless browser detection (35 points)
-  const isHeadless = userAgent.includes('headless') || 
-                     userAgent.includes('phantom') ||
-                     userAgent.includes('headlesschrome');
-  
-  if (isHeadless && !isLegitAutomation) {
-    score += 35;
-    reasons.push('Headless browser');
-  }
-
-  // ==================================================
-  // TIER 3: LOW CONFIDENCE SIGNALS (5-25 points)
-  // ==================================================
-
-  // Missing common browser headers (20 points)
-  // But only count if we already have other signals
   const hasAccept = request.headers.has('Accept');
   const hasAcceptLanguage = request.headers.has('Accept-Language');
   const hasAcceptEncoding = request.headers.has('Accept-Encoding');
-  const missingCount = [hasAccept, hasAcceptLanguage, hasAcceptEncoding].filter(h => !h).length;
+  const missingHeaders = !hasAccept && !hasAcceptLanguage && !hasAcceptEncoding;
   
-  if (missingCount === 3 && reasons.length > 0) {
-    // All three missing + other signals = likely bot
-    score += 20;
-    reasons.push('Missing browser headers');
-  } else if (missingCount === 2 && reasons.length > 0) {
-    score += 10;
-    reasons.push('Incomplete headers');
+  if (missingHeaders && hasBotKeywords) {
+    console.log('[BotCheck] Detected via missing headers + bot keywords');
+    return true;
   }
 
-  // Very short or empty user agent (15 points)
-  // But allow for privacy-focused browsers
-  if (userAgent.length === 0) {
-    score += 15;
-    reasons.push('Empty user-agent');
-  } else if (userAgent.length < 20 && userAgent.length > 0) {
-    score += 10;
-    reasons.push('Short user-agent');
+  // Empty or suspicious user agents
+  if (!userAgent || userAgent.length < 10) {
+    console.log('[BotCheck] Detected via empty/short user agent');
+    return true;
   }
 
-  // Suspicious referer patterns (10 points)
-  if (referer && (referer.includes('facebook.com') || referer.includes('fb.com') || 
-      referer.includes('instagram.com') || referer.includes('threads.net'))) {
-    score += 10;
-    reasons.push('Social media referer');
+  // Headless browsers
+  if (userAgent.includes('headless') || userAgent.includes('phantom')) {
+    console.log('[BotCheck] Detected via headless browser');
+    return true;
   }
 
-  // ==================================================
-  // NEGATIVE SIGNALS (Reduce score = MORE LIKELY HUMAN)
-  // ==================================================
-
-  // Has cookies (strong human signal) (-40 points)
-  const hasCookies = request.headers.has('Cookie');
-  if (hasCookies) {
-    score -= 40;
-    reasons.push('Has cookies (human signal)');
-  }
-
-  // Has JavaScript-related headers (-30 points)
-  const hasSecFetchDest = request.headers.has('Sec-Fetch-Dest');
-  const hasSecFetchMode = request.headers.has('Sec-Fetch-Mode');
-  const hasSecFetchSite = request.headers.has('Sec-Fetch-Site');
-  
-  if (hasSecFetchDest || hasSecFetchMode || hasSecFetchSite) {
-    score -= 30;
-    reasons.push('Browser security headers (human signal)');
-  }
-
-  // Modern browser user-agent with version numbers (-20 points)
-  const hasModernUA = /Chrome\/\d+|Firefox\/\d+|Safari\/\d+|Edge\/\d+/.test(userAgent);
-  if (hasModernUA && !hasBotKeywords) {
-    score -= 20;
-    reasons.push('Modern browser UA');
-  }
-
-  // Has DNT (Do Not Track) header (-10 points)
-  if (request.headers.has('DNT')) {
-    score -= 10;
-    reasons.push('DNT header (privacy-conscious user)');
-  }
-
-  // Complex Accept header (human browsers send detailed Accept) (-15 points)
-  const acceptHeader = request.headers.get('Accept') || '';
-  if (acceptHeader.length > 50 && acceptHeader.includes('text/html')) {
-    score -= 15;
-    reasons.push('Complex Accept header');
-  }
-
-  // ==================================================
-  // FINAL DETERMINATION
-  // ==================================================
-
-  // Ensure score doesn't go negative
-  score = Math.max(0, score);
-
-  // Determine bot/human based on threshold
-  let isBot = false;
-  
-  if (score >= BOT_THRESHOLD_DEFINITE) {
-    isBot = true;
-    confidence = 'very-high';
-  } else if (score >= BOT_THRESHOLD_LIKELY) {
-    isBot = true;
-    confidence = confidence === 'unknown' ? 'high' : confidence;
-  } else if (score < HUMAN_THRESHOLD) {
-    isBot = false;
-    confidence = 'human';
-  } else {
-    // Gray zone (40-59): Default to human to avoid false positive
-    // But if we have high-confidence signals, treat as bot
-    if (reasons.some(r => r.includes('Meta') || r.includes('Threads') || r.includes('Instagram'))) {
-      isBot = true;
-      confidence = 'medium';
-    } else {
-      isBot = false;
-      confidence = 'uncertain-human';
-    }
-  }
-
-  if (reasons.length === 0) {
-    reasons.push('No significant signals');
-    confidence = 'human';
-  }
-
-  return {
-    isBot,
-    score: Math.round(score),
-    reasons,
-    confidence,
-    userAgent: userAgent.substring(0, 100),
-    ip: ip ? ip.substring(0, 45) : 'unknown'
-  };
+  console.log('[BotCheck] Passed - identified as real user');
+  return false;
 }
 
-// ============================================
-// IP RANGE CHECKING (IPv4 + IPv6)
-// ============================================
-
-function isIPv4InMetaRanges(ip) {
+function isIPInMetaRanges(ip) {
   try {
     const ipParts = ip.split('.').map(Number);
     if (ipParts.length !== 4 || ipParts.some(isNaN)) return false;
     
     const ipNum = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
     
-    for (const range of META_IP_RANGES_V4) {
+    for (const range of META_IP_RANGES) {
+      if (range.includes(':')) continue; // Skip IPv6 for now
+      
       const [rangeIP, mask] = range.split('/');
       const rangeParts = rangeIP.split('.').map(Number);
       const rangeNum = (rangeParts[0] << 24) + (rangeParts[1] << 16) + (rangeParts[2] << 8) + rangeParts[3];
@@ -491,80 +262,9 @@ function isIPv4InMetaRanges(ip) {
       }
     }
   } catch (e) {
-    console.error('IPv4 range check error:', e);
+    console.error('IP range check error:', e);
   }
   return false;
-}
-
-function isIPv6InMetaRanges(ip) {
-  try {
-    // Normalize IPv6 (remove :: expansion for simpler matching)
-    const normalizedIP = normalizeIPv6(ip);
-    
-    for (const range of META_IP_RANGES_V6) {
-      const [prefix, mask] = range.split('/');
-      const maskBits = parseInt(mask);
-      
-      // Simple prefix matching for /32 ranges
-      if (maskBits === 32) {
-        const rangePrefix = prefix.substring(0, 9); // First 32 bits = first 4 hex groups
-        const ipPrefix = normalizedIP.substring(0, 9);
-        
-        if (ipPrefix === rangePrefix) {
-          return true;
-        }
-      }
-    }
-  } catch (e) {
-    console.error('IPv6 range check error:', e);
-  }
-  return false;
-}
-
-function normalizeIPv6(ip) {
-  // Basic IPv6 normalization
-  // Expand :: to full form
-  if (ip.includes('::')) {
-    const parts = ip.split('::');
-    const leftParts = parts[0] ? parts[0].split(':') : [];
-    const rightParts = parts[1] ? parts[1].split(':') : [];
-    const missingParts = 8 - leftParts.length - rightParts.length;
-    
-    const middle = Array(missingParts).fill('0000');
-    const fullParts = [...leftParts, ...middle, ...rightParts];
-    
-    return fullParts.map(p => p.padStart(4, '0')).join(':');
-  }
-  
-  return ip.split(':').map(p => p.padStart(4, '0')).join(':');
-}
-
-// ============================================
-// ANALYTICS LOGGING
-// ============================================
-
-async function logDetection(path, detectionResult, env) {
-  try {
-    const logKey = `analytics:${Date.now()}:${Math.random().toString(36).substring(7)}`;
-    
-    const logData = {
-      timestamp: new Date().toISOString(),
-      path: path,
-      isBot: detectionResult.isBot,
-      score: detectionResult.score,
-      confidence: detectionResult.confidence,
-      reasons: detectionResult.reasons,
-      userAgent: detectionResult.userAgent,
-      ip: detectionResult.ip,
-    };
-
-    // Store for 7 days for analysis
-    await env.LINK_STORAGE.put(logKey, JSON.stringify(logData), {
-      expirationTtl: 7 * 24 * 60 * 60
-    });
-  } catch (e) {
-    console.error('Logging error:', e);
-  }
 }
 
 // ============================================
@@ -620,6 +320,7 @@ async function updateCounter(path, linkData, env) {
 
 async function handleSaveLink(request, env) {
   const authHeader = request.headers.get('Authorization');
+  // Gunakan env.SECRET_KEY dengan fallback ke INJECTED_SECRET_KEY jika ada
   const SECRET_KEY = env.SECRET_KEY || (typeof INJECTED_SECRET_KEY !== 'undefined' ? INJECTED_SECRET_KEY : '');
 
   if (!SECRET_KEY || authHeader !== `Bearer ${SECRET_KEY}`) {
@@ -963,7 +664,7 @@ function addSecurityHeaders(headers) {
 function sanitizeText(str) {
   if (!str) return '';
   return str.replace(/<[^>]*>/g, '')
-            .replace(/[<>'"]/g, '')
+            .replace(/[<>'\"]/g, '')
             .substring(0, 200);
 }
 
@@ -972,7 +673,7 @@ function escapeHtml(str) {
   return str.replace(/&/g, '&amp;')
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
+            .replace(/\"/g, '&quot;')
             .replace(/'/g, '&#039;');
 }
 
