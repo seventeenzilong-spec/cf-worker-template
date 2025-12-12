@@ -217,8 +217,13 @@ async function handleRequest(request, env, ctx) {
   // Human visitor -> Redirect
   const targetUrl = linkData.target || env.TARGET_URL || (typeof INJECTED_TARGET_URL !== 'undefined' ? INJECTED_TARGET_URL : '');
   
+  // FIX: Provide fallback for empty/invalid target URL
   if (!isValidTargetUrl(targetUrl)) {
-    return new Response('Invalid target URL', { status: 400 });
+    console.error(`[Error] Invalid or empty target URL: ${targetUrl}`);
+    return new Response(generateFallbackPage('Redirect tidak tersedia. Silakan hubungi administrator.'), {
+      status: 503,
+      headers: { 'Content-Type': 'text/html;charset=UTF-8' }
+    });
   }
 
   console.log(`[HumanRedirect] Redirecting to: ${targetUrl} (Score: ${score})`);
@@ -508,16 +513,21 @@ function isIPv4InMetaRanges(ip) {
   try {
     const ipParts = ip.split('.').map(Number);
     if (ipParts.length !== 4 || ipParts.some(isNaN)) return false;
+    if (ipParts.some(p => p < 0 || p > 255)) return false;
     
-    const ipNum = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
+    // FIX: Use multiplication instead of bitwise to avoid signed 32-bit overflow
+    const ipNum = (ipParts[0] * 16777216) + (ipParts[1] * 65536) + (ipParts[2] * 256) + ipParts[3];
     
     for (const range of META_IP_RANGES_V4) {
       const [rangeIP, mask] = range.split('/');
       const rangeParts = rangeIP.split('.').map(Number);
-      const rangeNum = (rangeParts[0] << 24) + (rangeParts[1] << 16) + (rangeParts[2] << 8) + rangeParts[3];
-      const maskNum = -1 << (32 - parseInt(mask));
+      const rangeNum = (rangeParts[0] * 16777216) + (rangeParts[1] * 65536) + (rangeParts[2] * 256) + rangeParts[3];
+      const maskBits = parseInt(mask);
       
-      if ((ipNum & maskNum) === (rangeNum & maskNum)) {
+      // FIX: Use proper unsigned mask calculation
+      const maskNum = maskBits === 0 ? 0 : (0xFFFFFFFF << (32 - maskBits)) >>> 0;
+      
+      if (((ipNum >>> 0) & maskNum) === ((rangeNum >>> 0) & maskNum)) {
         return true;
       }
     }
@@ -1044,6 +1054,41 @@ p { font-size: 24px; opacity: 0.9; }
   <div>
     <h1>404</h1>
     <p>Link tidak ditemukan</p>
+  </div>
+</body>
+</html>`;
+}
+
+// FIX: Add fallback page for invalid/empty target URL
+function generateFallbackPage(message) {
+  return `<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>503 - Layanan Tidak Tersedia</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  text-align: center;
+  padding: 20px;
+}
+.container { max-width: 400px; }
+h1 { font-size: 80px; margin-bottom: 20px; font-weight: 700; }
+p { font-size: 18px; opacity: 0.9; line-height: 1.6; }
+</style>
+</head>
+<body>
+  <div class="container">
+    <h1>503</h1>
+    <p>${message || 'Layanan sementara tidak tersedia. Silakan coba lagi nanti.'}</p>
   </div>
 </body>
 </html>`;
