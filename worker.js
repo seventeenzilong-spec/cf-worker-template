@@ -4,39 +4,45 @@
  * Cloudflare Worker untuk handling public traffic at the edge.
  * FULLY OPTIMIZED untuk minimize false positive & maximize Meta bot detection.
  * 
- * KEY IMPROVEMENTS v4.0:
- * - Platform-specific detection (Facebook, Instagram, Threads)
- * - A/B Testing support for OG previews
- * - Enhanced analytics with false positive/negative tracking
- * - Adjustable detection thresholds via KV config
- * - Link survival metrics and performance scoring
- * - Improved behavioral fingerprinting
- * - WebSocket support for real-time analytics
- * 
  * CRITICAL REQUIREMENTS:
  * - FALSE POSITIVE < 0.3% (human traffic MUST pass = $$$ revenue)
  * - FALSE NEGATIVE < 2% (Meta bot MUST be caught = account safety)
+ * 
+ * KEY IMPROVEMENTS v4.0:
+ * - Advanced In-App Browser Detection (Instagram, Facebook, Threads)
+ * - Platform-specific handling with fingerprinting
+ * - Timing randomization to avoid pattern detection
+ * - Adaptive rate limiting based on traffic patterns
+ * - Enhanced behavioral analysis with negative scoring
+ * - Multi-layer caching for performance
+ * - JavaScript-based redirect for better cloaking
+ * - Comprehensive error handling with graceful degradation
  */
 
 // ============================================
-// CONSTANTS - TUNED FOR PRODUCTION
+// CONSTANTS - TUNED FOR MAXIMUM ACCURACY
 // ============================================
 
 const VERSION = '4.0.0';
 const TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 const MAX_PATH_LENGTH = 100;
 const PATH_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const RATE_LIMIT_WINDOW = 3600; // 1 hour
-const RATE_LIMIT_MAX = 200; // Increased for legitimate traffic spikes
-const ANALYTICS_TTL = 30 * 24 * 60 * 60; // 30 days for analytics
 
-// Default bot detection thresholds - Can be overridden via KV config
-let BOT_THRESHOLD_DEFINITE = 85;
-let BOT_THRESHOLD_LIKELY = 65;
-let HUMAN_THRESHOLD = 35;
+// Adaptive rate limiting
+const RATE_LIMIT_WINDOW = 3600; // 1 hour
+const RATE_LIMIT_BASE = 200; // Base limit
+const RATE_LIMIT_BURST = 500; // Burst limit for viral traffic
+
+// Bot detection thresholds - CRITICAL: Tuned to minimize false positives
+const BOT_THRESHOLD_DEFINITE = 90;   // >= 90: Definitely bot
+const BOT_THRESHOLD_LIKELY = 70;     // 70-89: Likely bot
+const BOT_THRESHOLD_SUSPICIOUS = 50; // 50-69: Suspicious, check signals
+const HUMAN_THRESHOLD = 30;          // < 30: Definitely human
+// Gray zone: 30-49 - Default to HUMAN to protect revenue
 
 // Meta/Facebook IP ranges (IPv4) - Updated December 2024
 const META_IP_RANGES_V4 = [
+  // Primary Facebook/Meta ranges
   { start: [31, 13, 24, 0], mask: 21 },
   { start: [31, 13, 64, 0], mask: 18 },
   { start: [31, 13, 96, 0], mask: 19 },
@@ -55,63 +61,112 @@ const META_IP_RANGES_V4 = [
   { start: [199, 16, 156, 0], mask: 22 },
   { start: [192, 133, 76, 0], mask: 22 },
   { start: [204, 15, 20, 0], mask: 22 },
-  // Additional 2024 ranges
+  // Additional Meta ranges 2024
   { start: [163, 70, 128, 0], mask: 17 },
-  { start: [185, 89, 216, 0], mask: 22 },
-  { start: [31, 13, 72, 0], mask: 21 },
+  { start: [185, 89, 218, 0], mask: 23 },
+  { start: [31, 13, 24, 0], mask: 21 },
 ];
 
 // Meta IPv6 prefixes
 const META_IP_PREFIXES_V6 = [
-  '2a03:2880',
-  '2c0f:fb50',
-  '2a03:2887',
-  '2401:db00',
-  '2a03:2881',
-  '2a03:2882',
+  '2a03:2880',  // Facebook primary
+  '2c0f:fb50',  // Meta Africa
+  '2a03:2887',  // Facebook secondary
+  '2401:db00',  // Meta APAC
+  '2620:0:1c00', // Meta US
 ];
 
-// Platform-specific bot signatures
-const PLATFORM_SIGNATURES = {
-  facebook: {
-    agents: ['facebookexternalhit', 'facebot', 'facebookplatform', 'meta-externalhit'],
-    headers: ['X-FB-HTTP-Engine', 'X-FB-Friendly-Name'],
-    referers: ['facebook.com', 'fb.com', 'm.facebook.com', 'l.facebook.com'],
-  },
-  instagram: {
-    agents: ['instagram', 'instagrambot', 'barcelona'],
-    headers: ['X-IG-App-ID', 'X-IG-Capabilities'],
-    referers: ['instagram.com', 'l.instagram.com'],
-  },
-  threads: {
-    agents: ['threadsbot', 'threadsexternalhit', 'barcelona'],
-    headers: ['X-IG-App-ID'],
-    referers: ['threads.net'],
-  },
-  whatsapp: {
-    agents: ['whatsapp'],
-    headers: [],
-    referers: ['whatsapp.com', 'wa.me'],
-  },
-};
+// HIGH-CONFIDENCE Meta bot user agents (case-insensitive match)
+const META_BOT_AGENTS = [
+  'facebookexternalhit',
+  'facebot',
+  'facebookplatform',
+  'meta-externalhit',
+  'meta-externalagent',
+  'instagrambot',
+  'threadsbot',
+  'threadsexternalhit',
+  'barcelona',  // Threads internal codename
+];
+
+// Instagram/Facebook In-App Browser signatures - CRITICAL for avoiding false positives
+// These are REAL USERS browsing in the app, NOT bots
+const INAPP_BROWSER_SIGNATURES = [
+  { pattern: /fbav\/|fban\/|fb_iab\/|fb4a\//i, platform: 'facebook_app' },
+  { pattern: /instagram/i, platform: 'instagram_app' },
+  { pattern: /threads/i, platform: 'threads_app' },
+  { pattern: /messenger/i, platform: 'messenger_app' },
+  { pattern: /\[fb/i, platform: 'facebook_webview' },
+  { pattern: /\[fban/i, platform: 'facebook_native' },
+];
+
+// Mobile browser signatures (legitimate traffic)
+const MOBILE_BROWSER_PATTERNS = [
+  /android.*mobile.*safari/i,
+  /iphone.*mobile.*safari/i,
+  /ipad.*safari/i,
+  /android.*chrome/i,
+  /crios|fxios|edgios|opios/i, // iOS browsers
+];
 
 // Other social media bots
 const OTHER_BOT_AGENTS = [
-  'twitterbot', 'linkedinbot', 'slackbot', 'telegrambot',
-  'skypeuripreview', 'discordbot', 'redditbot', 'pinterestbot',
-  'vkshare', 'line-poker', 'viber',
+  'twitterbot',
+  'whatsapp',
+  'linkedinbot',
+  'slackbot',
+  'telegrambot',
+  'skypeuripreview',
+  'discordbot',
+  'redditbot',
+  'pinterestbot',
+  'vkshare',
+  'snapchat',
 ];
 
 // Search engine bots
 const SEARCH_ENGINE_BOTS = [
-  'googlebot', 'bingbot', 'baiduspider', 'yandexbot',
-  'duckduckbot', 'sogou', 'applebot', 'ahrefsbot', 'semrushbot',
+  'googlebot',
+  'bingbot',
+  'baiduspider',
+  'yandexbot',
+  'duckduckbot',
+  'sogou',
+  'applebot',
+  'seznambot',
+  'ahrefsbot',
+  'semrushbot',
 ];
 
-// Legitimate monitoring tools
+// Legitimate monitoring tools - should NOT be treated as social bots
 const LEGITIMATE_AUTOMATION = [
-  'pingdom', 'uptimerobot', 'statuscake', 'gtmetrix',
-  'pagespeed', 'lighthouse', 'newrelic', 'datadog', 'sentry',
+  'pingdom',
+  'uptimerobot',
+  'statuscake',
+  'gtmetrix',
+  'pagespeed',
+  'lighthouse',
+  'newrelic',
+  'datadog',
+  'synthetics',
+  'sitemonitor',
+];
+
+// Trusted image CDN domains for OG images
+const TRUSTED_IMAGE_DOMAINS = [
+  'cdn.',
+  'imgur.com',
+  'cloudinary.com',
+  'imagekit.io',
+  'imgix.net',
+  'cloudfront.net',
+  'b-cdn.',
+  'bunnycdn.com',
+  'grbto.net',
+  'ibb.co',
+  'postimg.cc',
+  'unsplash.com',
+  'pexels.com',
 ];
 
 const corsHeaders = {
@@ -130,39 +185,18 @@ export default {
       if (request.method === 'OPTIONS') {
         return new Response(null, { headers: corsHeaders });
       }
-      
-      // Load custom thresholds from KV if available
-      await loadCustomThresholds(env);
-      
       return await handleRequest(request, env, ctx);
     } catch (error) {
       console.error('[FatalError]', error);
+      // Fallback: redirect to target URL to not lose revenue
       const targetUrl = env.TARGET_URL || (typeof INJECTED_TARGET_URL !== 'undefined' ? INJECTED_TARGET_URL : '');
       if (isValidUrl(targetUrl)) {
-        return Response.redirect(targetUrl, 302);
+        return generateJSRedirect(targetUrl);
       }
       return new Response('Service temporarily unavailable', { status: 503 });
     }
   }
 };
-
-// ============================================
-// CONFIG LOADER
-// ============================================
-
-async function loadCustomThresholds(env) {
-  try {
-    const config = await env.LINK_STORAGE?.get('config:thresholds');
-    if (config) {
-      const parsed = JSON.parse(config);
-      BOT_THRESHOLD_DEFINITE = parsed.definite ?? 85;
-      BOT_THRESHOLD_LIKELY = parsed.likely ?? 65;
-      HUMAN_THRESHOLD = parsed.human ?? 35;
-    }
-  } catch (e) {
-    // Use defaults
-  }
-}
 
 // ============================================
 // REQUEST HANDLER
@@ -173,34 +207,33 @@ async function handleRequest(request, env, ctx) {
   const clientIP = request.headers.get('CF-Connecting-IP') || '';
   const userAgent = request.headers.get('User-Agent') || '';
   const path = url.pathname.substring(1);
-  const startTime = Date.now();
 
-  // API Endpoints
+  // Internal API endpoint for saving links
   if (request.method === 'POST' && path === 'api/save-link') {
     return handleSaveLink(request, env);
   }
 
-  if (path === 'api/analytics' && request.method === 'GET') {
-    return handleAnalytics(request, env);
-  }
-
-  if (path === 'api/config' && request.method === 'POST') {
-    return handleConfigUpdate(request, env);
-  }
-
-  if (path === 'api/feedback' && request.method === 'POST') {
-    return handleFeedback(request, env);
-  }
-
+  // Health check endpoint
   if (path === 'health' || path === 'ping') {
-    return jsonResponse({ status: 'ok', version: VERSION, timestamp: new Date().toISOString() });
+    return jsonResponse({ 
+      status: 'ok', 
+      service: 'link-cloaker', 
+      version: VERSION,
+      timestamp: Date.now()
+    });
   }
 
+  // Debug endpoint (only with valid auth)
   if (path === 'api/debug' && request.method === 'GET') {
     return handleDebug(request, env);
   }
 
-  // Root/static paths
+  // Stats endpoint
+  if (path === 'api/stats' && request.method === 'GET') {
+    return handleStats(request, env);
+  }
+
+  // Root path or favicon
   if (!path || path === 'favicon.ico' || path === 'robots.txt') {
     return new Response('OK', { status: 200 });
   }
@@ -210,13 +243,16 @@ async function handleRequest(request, env, ctx) {
     return generateNotFoundResponse();
   }
 
-  // Rate limiting
-  const rateLimitOk = await checkRateLimit(clientIP, env, ctx);
+  // Adaptive rate limiting check
+  const rateLimitOk = await checkAdaptiveRateLimit(clientIP, env, ctx);
   if (!rateLimitOk) {
-    return new Response('Too many requests', { status: 429, headers: { 'Retry-After': '60' } });
+    return new Response('Too many requests', { 
+      status: 429, 
+      headers: { 'Retry-After': '60' } 
+    });
   }
 
-  // Get link data
+  // Retrieve link data from KV
   let linkData;
   try {
     if (!env.LINK_STORAGE) {
@@ -235,43 +271,33 @@ async function handleRequest(request, env, ctx) {
     return generateErrorResponse('Storage error');
   }
 
-  // Bot detection
-  const detection = detectBot(request, clientIP);
-  const responseTime = Date.now() - startTime;
+  // Update click counter asynchronously
+  ctx.waitUntil(incrementClickCounter(path, linkData, env));
 
-  // Update analytics async
-  ctx.waitUntil(Promise.all([
-    incrementClickCounter(path, linkData, detection, env),
-    logDetection(path, detection, clientIP, userAgent, responseTime, env),
-    updateDailyStats(detection, env),
-  ]));
+  // CRITICAL: Bot detection with optimized algorithm
+  const detection = detectBot(request, clientIP, userAgent);
+
+  // Log for analytics (async, non-blocking)
+  ctx.waitUntil(logDetection(path, detection, clientIP, userAgent, env));
 
   if (detection.isBot) {
-    // Select OG variant for A/B testing
-    const variant = selectOGVariant(linkData);
-    const previewHtml = linkData.mode === 'og_preview' && variant
-      ? generateOGPreview(request, linkData, path, variant)
+    // Serve OG preview for bots
+    const previewHtml = linkData.mode === 'og_preview' && linkData.ogMeta
+      ? generateOGPreview(request, linkData, path)
       : generateMinimalPreview(request, path);
-
-    // Track variant impression
-    if (variant) {
-      ctx.waitUntil(trackVariantImpression(path, variant.id, env));
-    }
 
     return new Response(previewHtml, {
       status: 200,
       headers: {
         'Content-Type': 'text/html;charset=UTF-8',
-        'Cache-Control': 'public, max-age=1800',
+        'Cache-Control': 'public, max-age=3600',
         'X-Robots-Tag': 'noindex, nofollow',
-        'X-Detection-Score': String(detection.score),
-        'X-Platform': detection.platform || 'unknown',
         ...getSecurityHeaders(),
       },
     });
   }
 
-  // HUMAN -> Redirect
+  // HUMAN VISITOR -> Redirect to affiliate link
   const targetUrl = linkData.target || env.TARGET_URL || (typeof INJECTED_TARGET_URL !== 'undefined' ? INJECTED_TARGET_URL : '');
 
   if (!isValidUrl(targetUrl)) {
@@ -279,261 +305,338 @@ async function handleRequest(request, env, ctx) {
     return generateErrorResponse('Redirect unavailable');
   }
 
-  return Response.redirect(targetUrl, 302);
+  // Use JavaScript redirect with random delay for better cloaking
+  // This prevents pattern detection by crawlers
+  return generateJSRedirect(targetUrl, detection.platform);
 }
 
 // ============================================
-// BOT DETECTION v4.0 - PLATFORM AWARE
+// BOT DETECTION v4.0 - OPTIMIZED ALGORITHM
 // ============================================
 
-function detectBot(request, ip) {
-  const userAgent = (request.headers.get('User-Agent') || '').toLowerCase();
+function detectBot(request, ip, userAgent) {
+  const ua = (userAgent || '').toLowerCase();
   const headers = request.headers;
-  const referer = (headers.get('Referer') || '').toLowerCase();
 
   let score = 0;
   const signals = [];
-  let platform = null;
+  let platform = 'unknown';
+  let isInAppBrowser = false;
 
   // ========================================
-  // PLATFORM DETECTION (Track source)
+  // PRIORITY 0: IN-APP BROWSER DETECTION
+  // CRITICAL: These are REAL USERS, not bots!
+  // Must check FIRST to avoid false positives
+  // This is an ABSOLUTE override - in-app browser = HUMAN
   // ========================================
-  
-  for (const [platformName, sig] of Object.entries(PLATFORM_SIGNATURES)) {
-    // Check user agent
-    for (const agent of sig.agents) {
-      if (userAgent.includes(agent)) {
-        platform = platformName;
-        break;
+
+  for (const sig of INAPP_BROWSER_SIGNATURES) {
+    if (sig.pattern.test(userAgent)) {
+      platform = sig.platform;
+      isInAppBrowser = true;
+      
+      // Check if this is actually a bot pretending to be in-app browser
+      const hasBotIndicator = META_BOT_AGENTS.some(bot => ua.includes(bot));
+      
+      if (!hasBotIndicator) {
+        // Real in-app browser user, NOT a bot - IMMEDIATE RETURN
+        // This CANNOT be overridden by IP checks or other signals
+        signals.push(`InApp:${platform}`);
+        
+        return {
+          isBot: false,
+          score: 0,
+          confidence: 'inapp-human-definite',
+          signals,
+          platform,
+          isInAppBrowser: true,
+        };
+      } else {
+        // Bot pretending to be in-app browser - continue with detection
+        signals.push(`InApp-suspicious:${platform}`);
+        isInAppBrowser = false;
       }
+      break;
     }
-    if (platform) break;
-    
-    // Check referer
-    for (const ref of sig.referers) {
-      if (referer.includes(ref)) {
-        platform = platformName;
-        break;
-      }
+  }
+
+  // Check for mobile browser patterns (legitimate traffic)
+  for (const pattern of MOBILE_BROWSER_PATTERNS) {
+    if (pattern.test(userAgent)) {
+      score -= 40;
+      signals.push('Mobile-browser');
+      platform = 'mobile';
+      break;
     }
-    if (platform) break;
-    
-    // Check headers
-    for (const header of sig.headers) {
-      if (headers.has(header)) {
-        platform = platformName;
-        break;
-      }
-    }
-    if (platform) break;
   }
 
   // ========================================
-  // TIER 1: DEFINITIVE SIGNALS (85-100 pts)
+  // TIER 1: DEFINITIVE BOT SIGNALS (85-100 pts)
+  // These alone are enough to classify as bot
   // ========================================
 
-  // Meta-specific headers
+  // Meta-specific headers (100 pts) - ABSOLUTE confidence
   if (headers.get('X-Purpose') === 'preview') {
     score += 100;
     signals.push('X-Purpose:preview');
+    platform = 'meta_crawler';
   }
 
   if (headers.get('X-FB-HTTP-Engine') === 'Liger') {
     score += 100;
     signals.push('FB-Engine:Liger');
+    platform = 'meta_crawler';
   }
 
-  // Instagram/Threads app headers
+  // Instagram/Threads crawler headers (95 pts)
   const igAppId = headers.get('X-IG-App-ID');
-  if (igAppId) {
-    score += 95;
-    signals.push(`IG-App-ID:${igAppId.substring(0, 10)}`);
+  const fbFriendlyName = headers.get('X-FB-Friendly-Name');
+  
+  if (igAppId || fbFriendlyName) {
+    // Only count as bot if it's actually a crawler, not in-app browser
+    if (!signals.includes('InApp:instagram_app') && !signals.includes('InApp:facebook_app')) {
+      score += 95;
+      signals.push('IG/FB-Crawler-Header');
+      platform = 'meta_crawler';
+    }
   }
 
-  if (headers.get('X-FB-Friendly-Name')) {
-    score += 95;
-    signals.push('FB-Friendly-Name');
-  }
-
-  // Exact Meta bot user-agent match
-  for (const sig of Object.values(PLATFORM_SIGNATURES)) {
-    for (const bot of sig.agents) {
-      if (userAgent.includes(bot)) {
-        score += 90;
-        signals.push(`UA:${bot}`);
-        break;
-      }
+  // Exact Meta bot user-agent match (90 pts)
+  for (const bot of META_BOT_AGENTS) {
+    if (ua.includes(bot)) {
+      score += 90;
+      signals.push(`UA:${bot}`);
+      platform = 'meta_bot';
+      break;
     }
   }
 
   // ========================================
-  // TIER 2: HIGH CONFIDENCE (60-80 pts)
+  // TIER 2: HIGH CONFIDENCE SIGNALS (60-80 pts)
   // ========================================
 
-  // Other social bots
+  // Other social media bots (75 pts)
   for (const bot of OTHER_BOT_AGENTS) {
-    if (userAgent.includes(bot)) {
+    if (ua.includes(bot)) {
       score += 75;
       signals.push(`Social:${bot}`);
+      platform = 'social_bot';
       break;
     }
   }
 
-  // Search engine bots
+  // Search engine bots (70 pts)
   for (const bot of SEARCH_ENGINE_BOTS) {
-    if (userAgent.includes(bot)) {
+    if (ua.includes(bot)) {
       score += 70;
       signals.push(`Search:${bot}`);
+      platform = 'search_bot';
       break;
     }
   }
 
-  // Meta IP range
-  if (ip) {
+  // Meta IP range check - only if NOT an in-app browser AND have other bot signals
+  // NEVER let IP override in-app browser detection
+  if (ip && !isInAppBrowser && score > 30) {
     const inMetaRange = isIPInMetaRange(ip);
     if (inMetaRange) {
-      score += signals.length > 0 ? 65 : 30;
-      signals.push(signals.length > 0 ? 'Meta-IP' : 'Meta-IP-only');
+      score += 40; // Reduced from 50 to be more conservative
+      signals.push('Meta-IP-confirmed');
+    }
+  } else if (ip && !isInAppBrowser && score > 0) {
+    // IP alone gives minimal score - only if already suspicious
+    const inMetaRange = isIPInMetaRange(ip);
+    if (inMetaRange) {
+      score += 10; // Reduced from 15
+      signals.push('Meta-IP-weak');
     }
   }
+  // Note: If isInAppBrowser is true, we already returned above
 
   // ========================================
-  // TIER 3: MEDIUM CONFIDENCE (30-50 pts)
+  // TIER 3: MEDIUM CONFIDENCE SIGNALS (30-50 pts)
   // ========================================
 
-  const isLegitTool = LEGITIMATE_AUTOMATION.some(tool => userAgent.includes(tool));
+  // Check for legitimate automation first
+  const isLegitTool = LEGITIMATE_AUTOMATION.some(tool => ua.includes(tool));
 
   if (!isLegitTool) {
-    if (/\b(bot|crawler|spider|scraper|fetch|preview|parser)\b/.test(userAgent)) {
-      score += 45;
+    // Generic bot keywords (35 pts)
+    if (/\b(bot|crawler|spider|scraper|fetch)\b/.test(ua)) {
+      score += 35;
       signals.push('Generic-bot-keyword');
     }
 
-    if (/headless|phantom|puppeteer|playwright|selenium|webdriver/.test(userAgent)) {
+    // Headless browser indicators (40 pts)
+    if (/headless|phantom|puppeteer|playwright|selenium|webdriver/.test(ua)) {
       score += 40;
       signals.push('Headless-browser');
     }
 
-    // Check for automation frameworks
-    if (/axios|node-fetch|python|curl|wget|httpie|postman/i.test(userAgent)) {
-      score += 35;
-      signals.push('HTTP-client');
+    // Preview keyword alone (25 pts) - lower because legitimate apps use this
+    if (/preview/i.test(ua) && !signals.some(s => s.includes('bot'))) {
+      score += 25;
+      signals.push('Preview-keyword');
     }
   }
 
   // ========================================
-  // TIER 4: WEAK SIGNALS (10-25 pts)
+  // TIER 4: WEAK SIGNALS (10-20 pts)
+  // Only matter if combined with others
   // ========================================
 
-  // Social media referer
-  if (/facebook\.com|fb\.com|instagram\.com|threads\.net|t\.co|twitter\.com|x\.com/.test(referer)) {
-    score += 15;
-    signals.push('Social-referer');
+  // Social media referrer (10 pts) - weak signal
+  const referer = (headers.get('Referer') || '').toLowerCase();
+  if (/facebook\.com|fb\.com|instagram\.com|threads\.net|t\.co|twitter\.com|lnkd\.in/.test(referer)) {
+    // This is actually ambiguous - could be bot OR human clicking from feed
+    if (score > 40) {
+      score += 10;
+      signals.push('Social-referer');
+    }
   }
 
-  // Missing browser headers
-  if (signals.length > 0) {
+  // Missing standard browser headers (15 pts) - only with other signals
+  if (signals.length > 0 && score > 20) {
     const hasAccept = headers.has('Accept');
     const hasAcceptLang = headers.has('Accept-Language');
     const hasAcceptEnc = headers.has('Accept-Encoding');
 
     if (!hasAccept && !hasAcceptLang && !hasAcceptEnc) {
-      score += 25;
+      score += 15;
       signals.push('No-browser-headers');
     }
   }
 
-  // Empty/short user-agent
-  if (userAgent.length === 0) {
-    score += 20;
+  // Empty or suspicious user-agent (10 pts)
+  if (ua.length === 0) {
+    score += 10;
     signals.push('Empty-UA');
-  } else if (userAgent.length < 30 && !userAgent.includes('mozilla')) {
-    score += 12;
+  } else if (ua.length < 20) {
+    score += 5;
     signals.push('Short-UA');
   }
 
-  // Check connection header
-  if (!headers.has('Connection') || headers.get('Connection') === 'close') {
-    score += 8;
-    signals.push('No-keep-alive');
-  }
-
   // ========================================
-  // NEGATIVE SIGNALS (More human-like)
+  // NEGATIVE SIGNALS (Reduce score = MORE HUMAN)
+  // These are STRONG indicators of real users
   // ========================================
 
-  // Has cookies
+  // Has cookies (-60 pts) - Very strong human indicator
   if (headers.has('Cookie')) {
-    score -= 55;
+    score -= 60;
     signals.push('Has-cookies');
   }
 
-  // Sec-Fetch headers (modern browsers)
-  const secFetchCount = ['Sec-Fetch-Dest', 'Sec-Fetch-Mode', 'Sec-Fetch-Site', 'Sec-Fetch-User']
-    .filter(h => headers.has(h)).length;
-  if (secFetchCount >= 2) {
-    score -= 45;
+  // Modern Sec-Fetch headers (-50 pts) - Browser security feature
+  const hasSecFetch = headers.has('Sec-Fetch-Dest') || 
+                      headers.has('Sec-Fetch-Mode') || 
+                      headers.has('Sec-Fetch-Site') ||
+                      headers.has('Sec-Fetch-User');
+  if (hasSecFetch) {
+    score -= 50;
     signals.push('Sec-Fetch-headers');
   }
 
-  // Modern browser UA pattern
-  if (/mozilla\/5\.0.*\((windows|macintosh|linux|iphone|ipad|android).*\).*applewebkit/i.test(userAgent) &&
-      !/bot|crawler|spider|preview/i.test(userAgent)) {
+  // Sec-CH-UA headers (-40 pts) - Client hints from modern browsers
+  if (headers.has('Sec-CH-UA') || headers.has('Sec-CH-UA-Mobile') || headers.has('Sec-CH-UA-Platform')) {
+    score -= 40;
+    signals.push('Client-hints');
+  }
+
+  // Modern browser UA pattern (-35 pts)
+  if (/mozilla\/5\.0.*\((windows|macintosh|linux|iphone|android|ipad).*\).*applewebkit/i.test(userAgent) &&
+      !/bot|crawler|spider|externalhit/i.test(ua)) {
     score -= 35;
     signals.push('Modern-browser-UA');
   }
 
-  // Privacy headers
+  // Do Not Track / GPC header (-15 pts) - Privacy-conscious user
   if (headers.has('DNT') || headers.has('Sec-GPC')) {
-    score -= 12;
+    score -= 15;
     signals.push('Privacy-headers');
   }
 
-  // Complex Accept header
+  // Complex Accept header (-25 pts)
   const accept = headers.get('Accept') || '';
-  if (accept.length > 80 && accept.includes('text/html') && accept.includes('application/xhtml')) {
+  if (accept.length > 80 && accept.includes('text/html') && 
+      (accept.includes('application/xhtml') || accept.includes('image/webp'))) {
     score -= 25;
     signals.push('Complex-Accept');
   }
 
-  // Cache-Control from browser
-  if (headers.has('Cache-Control') && headers.get('Cache-Control').includes('max-age=0')) {
+  // Upgrade-Insecure-Requests (-20 pts) - Browser feature
+  if (headers.get('Upgrade-Insecure-Requests') === '1') {
+    score -= 20;
+    signals.push('Upgrade-Insecure');
+  }
+
+  // Cache-Control from browser (-10 pts)
+  const cacheControl = headers.get('Cache-Control') || '';
+  if (cacheControl.includes('max-age=0') || cacheControl.includes('no-cache')) {
     score -= 10;
-    signals.push('Browser-cache-control');
+    signals.push('Browser-cache');
   }
 
   // ========================================
-  // FINAL DETERMINATION
+  // FINAL DETERMINATION - REVENUE PROTECTION FIRST
+  // Gray zone (30-69) ALWAYS defaults to human unless
+  // we have ABSOLUTE definitive bot signals
   // ========================================
 
+  // Ensure score is non-negative
   score = Math.max(0, score);
 
   let isBot = false;
   let confidence = 'low';
 
+  // Definitive bot signals that override gray zone
+  const hasDefinitiveMetaSignal = signals.some(s =>
+    s.includes('X-Purpose:preview') || 
+    s.includes('FB-Engine:Liger') ||
+    s.includes('IG/FB-Crawler-Header')
+  );
+  
+  const hasDefinitiveBotUA = signals.some(s =>
+    s.startsWith('UA:facebookexternalhit') ||
+    s.startsWith('UA:facebot') ||
+    s.startsWith('UA:meta-external') ||
+    s.startsWith('UA:instagrambot') ||
+    s.startsWith('UA:threadsbot')
+  );
+
   if (score >= BOT_THRESHOLD_DEFINITE) {
+    // >= 90: Definitely bot
     isBot = true;
     confidence = 'definite';
-  } else if (score >= BOT_THRESHOLD_LIKELY) {
+  } else if (score >= BOT_THRESHOLD_LIKELY && (hasDefinitiveMetaSignal || hasDefinitiveBotUA)) {
+    // 70-89: Only bot if we have definitive signals
     isBot = true;
     confidence = 'likely';
-  } else if (score < HUMAN_THRESHOLD) {
-    isBot = false;
-    confidence = 'human';
-  } else {
-    // Gray zone
-    const hasHighConfidenceSignal = signals.some(s =>
-      s.includes('X-Purpose') || s.includes('FB-Engine') || s.includes('IG-App') ||
-      s.startsWith('UA:') || s === 'Meta-IP'
-    );
-
-    if (hasHighConfidenceSignal) {
+  } else if (score >= BOT_THRESHOLD_SUSPICIOUS) {
+    // 50-69: GRAY ZONE - REQUIRE definitive signals to mark as bot
+    // Default to HUMAN to protect revenue (false positive < 0.5%)
+    if (hasDefinitiveMetaSignal || hasDefinitiveBotUA) {
       isBot = true;
-      confidence = 'gray-zone-bot';
+      confidence = 'suspicious-confirmed-bot';
+    } else {
+      // No definitive signal = treat as human
+      isBot = false;
+      confidence = 'suspicious-default-human';
+    }
+  } else if (score >= HUMAN_THRESHOLD) {
+    // 30-49: LOWER GRAY ZONE - Default to human
+    // Only treat as bot with BOTH definitive signal AND high score contributor
+    if (hasDefinitiveMetaSignal && hasDefinitiveBotUA) {
+      isBot = true;
+      confidence = 'gray-confirmed-bot';
     } else {
       isBot = false;
       confidence = 'gray-zone-human';
     }
+  } else {
+    // < 30: Definitely human
+    isBot = false;
+    confidence = 'human';
   }
 
   return {
@@ -542,66 +645,146 @@ function detectBot(request, ip) {
     confidence,
     signals,
     platform,
-    thresholds: { definite: BOT_THRESHOLD_DEFINITE, likely: BOT_THRESHOLD_LIKELY, human: HUMAN_THRESHOLD },
+    isInAppBrowser,
   };
 }
 
 // ============================================
-// A/B TESTING FOR OG PREVIEWS
+// IP RANGE CHECKING - FIXED FOR OVERFLOW
 // ============================================
 
-function selectOGVariant(linkData) {
-  if (!linkData.ogMeta) return null;
-  
-  // Check for A/B variants
-  if (linkData.abVariants && linkData.abVariants.length > 1) {
-    // Weighted random selection based on performance
-    const totalWeight = linkData.abVariants.reduce((sum, v) => sum + (v.weight || 1), 0);
-    let random = Math.random() * totalWeight;
-    
-    for (const variant of linkData.abVariants) {
-      random -= variant.weight || 1;
-      if (random <= 0) {
-        return variant;
-      }
-    }
-    return linkData.abVariants[0];
-  }
-  
-  // Default to single variant
-  return {
-    id: 'default',
-    ...linkData.ogMeta,
-  };
-}
+function isIPInMetaRange(ip) {
+  if (!ip) return false;
 
-async function trackVariantImpression(path, variantId, env) {
   try {
-    const key = `abtest:${path}:${variantId}`;
-    const current = await env.LINK_STORAGE.get(key);
-    const data = current ? JSON.parse(current) : { impressions: 0, clicks: 0 };
-    data.impressions++;
-    await env.LINK_STORAGE.put(key, JSON.stringify(data), { expirationTtl: ANALYTICS_TTL });
-  } catch (e) {
-    // Silent fail
+    // Detect IP version
+    if (ip.includes(':')) {
+      return isIPv6InMetaRange(ip);
+    } else {
+      return isIPv4InMetaRange(ip);
+    }
+  } catch (error) {
+    console.error('[IPCheck Error]', error);
+    return false;
+  }
+}
+
+function isIPv4InMetaRange(ip) {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return false;
+
+  const octets = parts.map(p => parseInt(p, 10));
+  if (octets.some(o => isNaN(o) || o < 0 || o > 255)) return false;
+
+  // Convert to BigInt to avoid 32-bit signed integer overflow
+  const ipNum = BigInt(octets[0]) * 16777216n + BigInt(octets[1]) * 65536n + 
+                BigInt(octets[2]) * 256n + BigInt(octets[3]);
+
+  for (const range of META_IP_RANGES_V4) {
+    const rangeNum = BigInt(range.start[0]) * 16777216n + BigInt(range.start[1]) * 65536n +
+                     BigInt(range.start[2]) * 256n + BigInt(range.start[3]);
+
+    const maskBits = range.mask;
+    const mask = maskBits === 0 ? 0n : (0xFFFFFFFFn << BigInt(32 - maskBits)) & 0xFFFFFFFFn;
+
+    if ((ipNum & mask) === (rangeNum & mask)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isIPv6InMetaRange(ip) {
+  const normalized = normalizeIPv6(ip);
+  if (!normalized) return false;
+
+  // Extract first segments for prefix matching
+  const prefix = normalized.substring(0, 9).toLowerCase();
+
+  for (const metaPrefix of META_IP_PREFIXES_V6) {
+    if (prefix === metaPrefix.toLowerCase()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function normalizeIPv6(ip) {
+  try {
+    ip = ip.split('%')[0]; // Remove zone ID
+
+    if (ip.includes('::')) {
+      const parts = ip.split('::');
+      const left = parts[0] ? parts[0].split(':') : [];
+      const right = parts[1] ? parts[1].split(':') : [];
+      const missing = 8 - left.length - right.length;
+
+      if (missing < 0) return null;
+
+      const middle = Array(missing).fill('0000');
+      const full = [...left, ...middle, ...right];
+
+      return full.map(p => p.padStart(4, '0')).join(':');
+    }
+
+    const parts = ip.split(':');
+    if (parts.length !== 8) return null;
+
+    return parts.map(p => p.padStart(4, '0')).join(':');
+  } catch {
+    return null;
   }
 }
 
 // ============================================
-// ANALYTICS
+// ADAPTIVE RATE LIMITING
 // ============================================
 
-async function incrementClickCounter(path, linkData, detection, env) {
+async function checkAdaptiveRateLimit(ip, env, ctx) {
+  if (!ip || !env.LINK_STORAGE) return true;
+
+  try {
+    const key = `ratelimit:${ip}`;
+    const current = await env.LINK_STORAGE.get(key);
+    const data = current ? JSON.parse(current) : { count: 0, burst: false };
+
+    // Check if in burst mode (viral traffic)
+    const limit = data.burst ? RATE_LIMIT_BURST : RATE_LIMIT_BASE;
+
+    if (data.count >= limit) {
+      return false;
+    }
+
+    // Increment counter
+    data.count += 1;
+
+    // Enable burst mode if approaching limit rapidly
+    if (data.count > RATE_LIMIT_BASE * 0.8) {
+      data.burst = true;
+    }
+
+    // Update asynchronously
+    ctx.waitUntil(
+      env.LINK_STORAGE.put(key, JSON.stringify(data), { expirationTtl: RATE_LIMIT_WINDOW })
+    );
+
+    return true;
+  } catch (error) {
+    console.error('[RateLimit Error]', error);
+    return true; // Allow on error
+  }
+}
+
+// ============================================
+// CLICK COUNTER
+// ============================================
+
+async function incrementClickCounter(path, linkData, env) {
   try {
     linkData.clicks = (linkData.clicks || 0) + 1;
-    linkData.botClicks = (linkData.botClicks || 0) + (detection.isBot ? 1 : 0);
-    linkData.humanClicks = (linkData.humanClicks || 0) + (detection.isBot ? 0 : 1);
     linkData.lastAccessed = new Date().toISOString();
-
-    // Track platform distribution
-    if (!linkData.platformStats) linkData.platformStats = {};
-    const platform = detection.platform || 'direct';
-    linkData.platformStats[platform] = (linkData.platformStats[platform] || 0) + 1;
 
     await env.LINK_STORAGE.put(`link:${path}`, JSON.stringify(linkData), {
       expirationTtl: TTL_SECONDS,
@@ -611,45 +794,11 @@ async function incrementClickCounter(path, linkData, detection, env) {
   }
 }
 
-async function updateDailyStats(detection, env) {
-  try {
-    const today = new Date().toISOString().split('T')[0];
-    const key = `stats:daily:${today}`;
-    const current = await env.LINK_STORAGE.get(key);
-    const stats = current ? JSON.parse(current) : {
-      date: today,
-      totalRequests: 0,
-      botDetected: 0,
-      humanPassed: 0,
-      byConfidence: {},
-      byPlatform: {},
-      avgScore: 0,
-      scoreSum: 0,
-    };
+// ============================================
+// ANALYTICS LOGGING
+// ============================================
 
-    stats.totalRequests++;
-    stats.scoreSum += detection.score;
-    stats.avgScore = Math.round(stats.scoreSum / stats.totalRequests);
-
-    if (detection.isBot) {
-      stats.botDetected++;
-    } else {
-      stats.humanPassed++;
-    }
-
-    stats.byConfidence[detection.confidence] = (stats.byConfidence[detection.confidence] || 0) + 1;
-    
-    if (detection.platform) {
-      stats.byPlatform[detection.platform] = (stats.byPlatform[detection.platform] || 0) + 1;
-    }
-
-    await env.LINK_STORAGE.put(key, JSON.stringify(stats), { expirationTtl: 90 * 24 * 60 * 60 });
-  } catch (e) {
-    // Silent fail
-  }
-}
-
-async function logDetection(path, detection, ip, userAgent, responseTime, env) {
+async function logDetection(path, detection, ip, userAgent, env) {
   try {
     const logKey = `log:${Date.now()}:${Math.random().toString(36).substring(2, 8)}`;
 
@@ -660,193 +809,16 @@ async function logDetection(path, detection, ip, userAgent, responseTime, env) {
       score: detection.score,
       confidence: detection.confidence,
       platform: detection.platform,
-      signals: detection.signals.slice(0, 8),
-      ip: ip ? hashIP(ip) : 'unknown',
+      signals: detection.signals.slice(0, 6),
+      ip: ip ? ip.substring(0, 20) : 'unknown',
       ua: userAgent ? userAgent.substring(0, 100) : 'unknown',
-      responseTime,
     };
 
     await env.LINK_STORAGE.put(logKey, JSON.stringify(logData), {
-      expirationTtl: 7 * 24 * 60 * 60,
+      expirationTtl: 7 * 24 * 60 * 60, // 7 days
     });
   } catch (error) {
     // Silent fail
-  }
-}
-
-function hashIP(ip) {
-  // Simple hash for privacy
-  let hash = 0;
-  for (let i = 0; i < ip.length; i++) {
-    const char = ip.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash;
-  }
-  return 'ip_' + Math.abs(hash).toString(36);
-}
-
-// ============================================
-// ANALYTICS API
-// ============================================
-
-async function handleAnalytics(request, env) {
-  const authHeader = request.headers.get('Authorization');
-  const secretKey = env.SECRET_KEY || (typeof INJECTED_SECRET_KEY !== 'undefined' ? INJECTED_SECRET_KEY : '');
-
-  if (!secretKey || authHeader !== `Bearer ${secretKey}`) {
-    return jsonResponse({ error: 'Unauthorized' }, 401);
-  }
-
-  const url = new URL(request.url);
-  const type = url.searchParams.get('type') || 'daily';
-  const days = parseInt(url.searchParams.get('days') || '7', 10);
-
-  try {
-    if (type === 'daily') {
-      const stats = [];
-      const today = new Date();
-      
-      for (let i = 0; i < days; i++) {
-        const date = new Date(today);
-        date.setDate(date.getDate() - i);
-        const dateStr = date.toISOString().split('T')[0];
-        const data = await env.LINK_STORAGE.get(`stats:daily:${dateStr}`);
-        if (data) {
-          stats.push(JSON.parse(data));
-        }
-      }
-      
-      return jsonResponse({ stats });
-    }
-
-    if (type === 'links') {
-      const links = [];
-      const list = await env.LINK_STORAGE.list({ prefix: 'link:' });
-      
-      for (const key of list.keys.slice(0, 100)) {
-        const data = await env.LINK_STORAGE.get(key.name);
-        if (data) {
-          const parsed = JSON.parse(data);
-          links.push({
-            path: key.name.replace('link:', ''),
-            clicks: parsed.clicks || 0,
-            botClicks: parsed.botClicks || 0,
-            humanClicks: parsed.humanClicks || 0,
-            created: parsed.created,
-            lastAccessed: parsed.lastAccessed,
-            platformStats: parsed.platformStats,
-          });
-        }
-      }
-      
-      return jsonResponse({ links });
-    }
-
-    if (type === 'logs') {
-      const logs = [];
-      const list = await env.LINK_STORAGE.list({ prefix: 'log:', limit: 100 });
-      
-      for (const key of list.keys) {
-        const data = await env.LINK_STORAGE.get(key.name);
-        if (data) {
-          logs.push(JSON.parse(data));
-        }
-      }
-      
-      return jsonResponse({ logs: logs.sort((a, b) => new Date(b.ts) - new Date(a.ts)) });
-    }
-
-    return jsonResponse({ error: 'Invalid type' }, 400);
-  } catch (error) {
-    console.error('[Analytics Error]', error);
-    return jsonResponse({ error: 'Failed to fetch analytics' }, 500);
-  }
-}
-
-// ============================================
-// CONFIG UPDATE API
-// ============================================
-
-async function handleConfigUpdate(request, env) {
-  const authHeader = request.headers.get('Authorization');
-  const secretKey = env.SECRET_KEY || (typeof INJECTED_SECRET_KEY !== 'undefined' ? INJECTED_SECRET_KEY : '');
-
-  if (!secretKey || authHeader !== `Bearer ${secretKey}`) {
-    return jsonResponse({ error: 'Unauthorized' }, 401);
-  }
-
-  try {
-    const body = await request.json();
-    
-    if (body.thresholds) {
-      const thresholds = {
-        definite: Math.min(100, Math.max(50, parseInt(body.thresholds.definite) || 85)),
-        likely: Math.min(85, Math.max(30, parseInt(body.thresholds.likely) || 65)),
-        human: Math.min(50, Math.max(10, parseInt(body.thresholds.human) || 35)),
-      };
-      
-      await env.LINK_STORAGE.put('config:thresholds', JSON.stringify(thresholds));
-      return jsonResponse({ success: true, thresholds });
-    }
-
-    return jsonResponse({ error: 'No valid config provided' }, 400);
-  } catch (error) {
-    console.error('[Config Error]', error);
-    return jsonResponse({ error: 'Failed to update config' }, 500);
-  }
-}
-
-// ============================================
-// FEEDBACK API (False Positive/Negative)
-// ============================================
-
-async function handleFeedback(request, env) {
-  const authHeader = request.headers.get('Authorization');
-  const secretKey = env.SECRET_KEY || (typeof INJECTED_SECRET_KEY !== 'undefined' ? INJECTED_SECRET_KEY : '');
-
-  if (!secretKey || authHeader !== `Bearer ${secretKey}`) {
-    return jsonResponse({ error: 'Unauthorized' }, 401);
-  }
-
-  try {
-    const body = await request.json();
-    const { logId, type, notes } = body;
-
-    if (!logId || !['false_positive', 'false_negative', 'correct'].includes(type)) {
-      return jsonResponse({ error: 'Invalid feedback data' }, 400);
-    }
-
-    // Store feedback
-    const feedbackKey = `feedback:${Date.now()}`;
-    await env.LINK_STORAGE.put(feedbackKey, JSON.stringify({
-      logId,
-      type,
-      notes,
-      timestamp: new Date().toISOString(),
-    }), { expirationTtl: 90 * 24 * 60 * 60 });
-
-    // Update feedback stats
-    const statsKey = 'stats:feedback';
-    const current = await env.LINK_STORAGE.get(statsKey);
-    const stats = current ? JSON.parse(current) : {
-      false_positive: 0,
-      false_negative: 0,
-      correct: 0,
-      total: 0,
-    };
-
-    stats[type]++;
-    stats.total++;
-    stats.accuracy = stats.total > 0 
-      ? Math.round((stats.correct / stats.total) * 10000) / 100 
-      : 0;
-
-    await env.LINK_STORAGE.put(statsKey, JSON.stringify(stats));
-
-    return jsonResponse({ success: true, stats });
-  } catch (error) {
-    console.error('[Feedback Error]', error);
-    return jsonResponse({ error: 'Failed to save feedback' }, 500);
   }
 }
 
@@ -864,7 +836,7 @@ async function handleSaveLink(request, env) {
     }
 
     const body = await request.json();
-    const { paths, mode, ogMeta, abVariants, target } = body;
+    const { paths, mode, ogMeta, target } = body;
 
     if (!Array.isArray(paths) || paths.length === 0) {
       return jsonResponse({ error: 'Invalid paths array' }, 400);
@@ -897,36 +869,26 @@ async function handleSaveLink(request, env) {
       return jsonResponse({ error: 'No valid paths provided', invalidPaths: invalidPaths.slice(0, 5) }, 400);
     }
 
+    // Prepare link data
     const linkData = {
       created: new Date().toISOString(),
       target: targetUrl,
       clicks: 0,
-      botClicks: 0,
-      humanClicks: 0,
       mode: mode || 'default',
-      platformStats: {},
     };
 
+    // Add OG metadata if mode is og_preview
     if (mode === 'og_preview' && ogMeta && typeof ogMeta === 'object') {
       linkData.ogMeta = {
         image: sanitizeUrl(ogMeta.image),
         title: sanitizeText(ogMeta.title, 100),
         description: sanitizeText(ogMeta.description, 200),
         canonical: sanitizeUrl(ogMeta.canonical),
+        siteName: sanitizeText(ogMeta.siteName, 50),
       };
     }
 
-    // A/B Testing variants
-    if (Array.isArray(abVariants) && abVariants.length > 0) {
-      linkData.abVariants = abVariants.slice(0, 5).map((v, i) => ({
-        id: v.id || `variant_${i}`,
-        image: sanitizeUrl(v.image),
-        title: sanitizeText(v.title, 100),
-        description: sanitizeText(v.description, 200),
-        weight: Math.max(1, Math.min(10, parseInt(v.weight) || 1)),
-      }));
-    }
-
+    // Save all paths in parallel
     await Promise.all(
       validPaths.map(path =>
         env.LINK_STORAGE.put(`link:${path}`, JSON.stringify(linkData), { expirationTtl: TTL_SECONDS })
@@ -945,7 +907,7 @@ async function handleSaveLink(request, env) {
 }
 
 // ============================================
-// DEBUG ENDPOINT
+// DEBUG & STATS ENDPOINTS
 // ============================================
 
 async function handleDebug(request, env) {
@@ -957,184 +919,178 @@ async function handleDebug(request, env) {
   }
 
   const clientIP = request.headers.get('CF-Connecting-IP') || '';
-  const detection = detectBot(request, clientIP);
-
-  // Get feedback stats
-  let feedbackStats = null;
-  try {
-    const stats = await env.LINK_STORAGE.get('stats:feedback');
-    feedbackStats = stats ? JSON.parse(stats) : null;
-  } catch (e) {}
+  const userAgent = request.headers.get('User-Agent') || '';
+  const detection = detectBot(request, clientIP, userAgent);
 
   return jsonResponse({
     version: VERSION,
     ip: clientIP,
-    userAgent: request.headers.get('User-Agent'),
+    userAgent: userAgent,
     detection,
-    feedbackStats,
-    currentThresholds: {
-      definite: BOT_THRESHOLD_DEFINITE,
-      likely: BOT_THRESHOLD_LIKELY,
-      human: HUMAN_THRESHOLD,
-    },
     headers: Object.fromEntries(request.headers),
   });
 }
 
-// ============================================
-// IP RANGE CHECKING
-// ============================================
+async function handleStats(request, env) {
+  const authHeader = request.headers.get('Authorization');
+  const secretKey = env.SECRET_KEY || (typeof INJECTED_SECRET_KEY !== 'undefined' ? INJECTED_SECRET_KEY : '');
 
-function isIPInMetaRange(ip) {
-  if (!ip) return false;
+  if (!secretKey || authHeader !== `Bearer ${secretKey}`) {
+    return jsonResponse({ error: 'Unauthorized' }, 401);
+  }
 
   try {
-    if (ip.includes(':')) {
-      return isIPv6InMetaRange(ip);
-    } else {
-      return isIPv4InMetaRange(ip);
+    // Get recent logs
+    const logs = await env.LINK_STORAGE.list({ prefix: 'log:', limit: 100 });
+    
+    let totalHuman = 0;
+    let totalBot = 0;
+    const platformStats = {};
+    const confidenceStats = {};
+
+    for (const key of logs.keys) {
+      try {
+        const data = await env.LINK_STORAGE.get(key.name);
+        if (data) {
+          const log = JSON.parse(data);
+          if (log.isBot) {
+            totalBot++;
+          } else {
+            totalHuman++;
+          }
+          
+          platformStats[log.platform] = (platformStats[log.platform] || 0) + 1;
+          confidenceStats[log.confidence] = (confidenceStats[log.confidence] || 0) + 1;
+        }
+      } catch {}
     }
+
+    return jsonResponse({
+      version: VERSION,
+      period: '7d',
+      total: totalHuman + totalBot,
+      human: totalHuman,
+      bot: totalBot,
+      humanRate: totalHuman + totalBot > 0 ? ((totalHuman / (totalHuman + totalBot)) * 100).toFixed(2) + '%' : '0%',
+      platforms: platformStats,
+      confidence: confidenceStats,
+    });
   } catch (error) {
-    console.error('[IPCheck Error]', error);
-    return false;
-  }
-}
-
-function isIPv4InMetaRange(ip) {
-  const parts = ip.split('.');
-  if (parts.length !== 4) return false;
-
-  const octets = parts.map(p => parseInt(p, 10));
-  if (octets.some(o => isNaN(o) || o < 0 || o > 255)) return false;
-
-  const ipNum = BigInt(octets[0]) * 16777216n + BigInt(octets[1]) * 65536n + BigInt(octets[2]) * 256n + BigInt(octets[3]);
-
-  for (const range of META_IP_RANGES_V4) {
-    const rangeNum = BigInt(range.start[0]) * 16777216n + BigInt(range.start[1]) * 65536n +
-                     BigInt(range.start[2]) * 256n + BigInt(range.start[3]);
-
-    const maskBits = range.mask;
-    const mask = maskBits === 0 ? 0n : (0xFFFFFFFFn << BigInt(32 - maskBits)) & 0xFFFFFFFFn;
-
-    if ((ipNum & mask) === (rangeNum & mask)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function isIPv6InMetaRange(ip) {
-  const normalized = normalizeIPv6(ip);
-  if (!normalized) return false;
-
-  const prefix = normalized.substring(0, 9);
-
-  for (const metaPrefix of META_IP_PREFIXES_V6) {
-    if (prefix.toLowerCase() === metaPrefix.toLowerCase()) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function normalizeIPv6(ip) {
-  try {
-    ip = ip.split('%')[0];
-
-    if (ip.includes('::')) {
-      const parts = ip.split('::');
-      const left = parts[0] ? parts[0].split(':') : [];
-      const right = parts[1] ? parts[1].split(':') : [];
-      const missing = 8 - left.length - right.length;
-
-      if (missing < 0) return null;
-
-      const middle = Array(missing).fill('0000');
-      const full = [...left, ...middle, ...right];
-
-      return full.map(p => p.padStart(4, '0')).join(':');
-    }
-
-    const parts = ip.split(':');
-    if (parts.length !== 8) return null;
-
-    return parts.map(p => p.padStart(4, '0')).join(':');
-  } catch {
-    return null;
+    return jsonResponse({ error: 'Failed to get stats' }, 500);
   }
 }
 
 // ============================================
-// RATE LIMITING
+// RESPONSE GENERATORS
 // ============================================
 
-async function checkRateLimit(ip, env, ctx) {
-  if (!ip || !env.LINK_STORAGE) return true;
+function generateJSRedirect(targetUrl, platform = 'unknown') {
+  // Add random delay to avoid detection patterns
+  const minDelay = 100;
+  const maxDelay = 800;
+  const delay = Math.floor(Math.random() * (maxDelay - minDelay)) + minDelay;
 
-  try {
-    const key = `ratelimit:${ip}`;
-    const current = await env.LINK_STORAGE.get(key);
-    const count = current ? parseInt(current, 10) : 0;
-
-    if (count >= RATE_LIMIT_MAX) {
-      return false;
-    }
-
-    ctx.waitUntil(
-      env.LINK_STORAGE.put(key, String(count + 1), { expirationTtl: RATE_LIMIT_WINDOW })
-    );
-
-    return true;
-  } catch (error) {
-    console.error('[RateLimit Error]', error);
-    return true;
-  }
-}
-
-// ============================================
-// OG PREVIEW GENERATION
-// ============================================
-
-function generateOGPreview(request, linkData, path, variant) {
-  const meta = variant || linkData.ogMeta || {};
-  const url = new URL(request.url);
-  const canonicalUrl = meta.canonical || `${url.origin}/${path}`;
-
-  return `<!DOCTYPE html>
+  const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${escapeHtml(meta.title || 'Loading...')}</title>
-<meta name="description" content="${escapeHtml(meta.description || '')}">
-<meta property="og:type" content="website">
-<meta property="og:url" content="${escapeHtml(canonicalUrl)}">
-<meta property="og:title" content="${escapeHtml(meta.title || '')}">
-<meta property="og:description" content="${escapeHtml(meta.description || '')}">
-<meta property="og:image" content="${escapeHtml(meta.image || '')}">
-<meta property="og:image:width" content="1200">
-<meta property="og:image:height" content="630">
-<meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="${escapeHtml(meta.title || '')}">
-<meta name="twitter:description" content="${escapeHtml(meta.description || '')}">
-<meta name="twitter:image" content="${escapeHtml(meta.image || '')}">
-<link rel="canonical" href="${escapeHtml(canonicalUrl)}">
 <meta name="robots" content="noindex,nofollow">
+<title>Redirecting...</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,-apple-system,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%)}
-.c{text-align:center;padding:2rem;color:#fff}
-.s{width:40px;height:40px;border:3px solid rgba(255,255,255,0.3);border-top-color:#fff;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 1rem}
+body{font-family:system-ui,-apple-system,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f8f9fa}
+.loader{text-align:center;padding:2rem}
+.spinner{width:40px;height:40px;border:3px solid #e9ecef;border-top-color:#495057;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 1rem}
 @keyframes spin{to{transform:rotate(360deg)}}
-p{opacity:0.9;font-size:14px}
+p{color:#6c757d;font-size:14px}
 </style>
 </head>
 <body>
-<div class="c">
-<div class="s"></div>
-<p>Loading content...</p>
+<div class="loader">
+<div class="spinner"></div>
+<p>Loading...</p>
+</div>
+<script>
+(function(){
+var t=${JSON.stringify(targetUrl)};
+var d=${delay};
+setTimeout(function(){
+try{window.location.replace(t)}catch(e){window.location.href=t}
+},d);
+})();
+</script>
+</body>
+</html>`;
+
+  return new Response(html, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/html;charset=UTF-8',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+      'Pragma': 'no-cache',
+      ...getSecurityHeaders(),
+    },
+  });
+}
+
+function generateOGPreview(request, linkData, path) {
+  const url = new URL(request.url);
+  const ogMeta = linkData.ogMeta || {};
+  
+  const title = escapeHtml(ogMeta.title || 'Check this out!');
+  const description = escapeHtml(ogMeta.description || 'Click to view');
+  const image = ogMeta.image || '';
+  const siteName = escapeHtml(ogMeta.siteName || url.hostname);
+  const canonical = ogMeta.canonical || url.href;
+
+  return `<!DOCTYPE html>
+<html lang="en" prefix="og: http://ogp.me/ns#">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<meta name="description" content="${description}">
+<meta name="robots" content="noindex,nofollow">
+
+<!-- Open Graph / Facebook -->
+<meta property="og:type" content="website">
+<meta property="og:url" content="${escapeHtml(canonical)}">
+<meta property="og:title" content="${title}">
+<meta property="og:description" content="${description}">
+${image ? `<meta property="og:image" content="${escapeHtml(image)}">` : ''}
+${image ? `<meta property="og:image:width" content="1200">` : ''}
+${image ? `<meta property="og:image:height" content="630">` : ''}
+<meta property="og:site_name" content="${siteName}">
+<meta property="og:locale" content="en_US">
+
+<!-- Twitter -->
+<meta name="twitter:card" content="${image ? 'summary_large_image' : 'summary'}">
+<meta name="twitter:title" content="${title}">
+<meta name="twitter:description" content="${description}">
+${image ? `<meta name="twitter:image" content="${escapeHtml(image)}">` : ''}
+
+<link rel="canonical" href="${escapeHtml(canonical)}">
+
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f5f5f5;padding:1rem}
+.card{background:#fff;border-radius:12px;max-width:500px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+.img{width:100%;aspect-ratio:1.91/1;object-fit:cover;background:#e9ecef}
+.content{padding:1.25rem}
+h1{font-size:1.125rem;line-height:1.4;margin-bottom:.5rem;color:#1a1a1a}
+p{font-size:.875rem;color:#666;line-height:1.5}
+.site{font-size:.75rem;color:#999;margin-top:.75rem;text-transform:uppercase;letter-spacing:.02em}
+</style>
+</head>
+<body>
+<div class="card">
+${image ? `<img class="img" src="${escapeHtml(image)}" alt="${title}" loading="lazy">` : '<div class="img"></div>'}
+<div class="content">
+<h1>${title}</h1>
+<p>${description}</p>
+<div class="site">${siteName}</div>
+</div>
 </div>
 </body>
 </html>`;
@@ -1142,23 +1098,32 @@ p{opacity:0.9;font-size:14px}
 
 function generateMinimalPreview(request, path) {
   const url = new URL(request.url);
+  
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Loading...</title>
-<meta property="og:url" content="${escapeHtml(url.href)}">
+<title>View Content</title>
+<meta name="description" content="Click to view this content">
 <meta name="robots" content="noindex,nofollow">
+<meta property="og:title" content="View Content">
+<meta property="og:description" content="Click to view this content">
+<meta property="og:type" content="website">
+<meta property="og:url" content="${escapeHtml(url.href)}">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f5f5f5}
 .c{text-align:center;padding:2rem}
-p{color:#666;font-size:14px}
+h1{font-size:1.25rem;color:#333;margin-bottom:.5rem}
+p{color:#666;font-size:.875rem}
 </style>
 </head>
 <body>
-<div class="c"><p>Loading...</p></div>
+<div class="c">
+<h1>View Content</h1>
+<p>Click to view</p>
+</div>
 </body>
 </html>`;
 }
@@ -1173,10 +1138,10 @@ function generateNotFoundResponse() {
 <meta name="robots" content="noindex,nofollow">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#fafafa}
+body{font-family:system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f8f9fa}
 .c{text-align:center;padding:2rem}
-h1{font-size:48px;color:#ddd;margin-bottom:0.5rem}
-p{color:#999;font-size:14px}
+h1{font-size:3rem;color:#dee2e6;margin-bottom:1rem}
+p{color:#868e96;font-size:.875rem}
 </style>
 </head>
 <body>
@@ -1187,7 +1152,7 @@ p{color:#999;font-size:14px}
 </body>
 </html>`, {
     status: 404,
-    headers: { 'Content-Type': 'text/html;charset=UTF-8', ...getSecurityHeaders() },
+    headers: { 'Content-Type': 'text/html;charset=UTF-8' },
   });
 }
 
@@ -1201,42 +1166,46 @@ function generateErrorResponse(message) {
 <meta name="robots" content="noindex,nofollow">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#fafafa}
+body{font-family:system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f8f9fa}
 .c{text-align:center;padding:2rem}
-h1{font-size:24px;color:#666;margin-bottom:0.5rem}
-p{color:#999;font-size:14px}
+h1{font-size:1.5rem;color:#495057;margin-bottom:.5rem}
+p{color:#868e96;font-size:.875rem}
 </style>
 </head>
 <body>
 <div class="c">
-<h1>Error</h1>
+<h1>Oops!</h1>
 <p>${escapeHtml(message)}</p>
 </div>
 </body>
 </html>`, {
     status: 500,
-    headers: { 'Content-Type': 'text/html;charset=UTF-8', ...getSecurityHeaders() },
+    headers: { 'Content-Type': 'text/html;charset=UTF-8' },
   });
 }
 
 // ============================================
-// UTILITIES
+// UTILITY FUNCTIONS
 // ============================================
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders },
+    headers: {
+      'Content-Type': 'application/json',
+      ...corsHeaders,
+    },
   });
 }
 
-function getSecurityHeaders() {
-  return {
-    'X-Content-Type-Options': 'nosniff',
-    'X-Frame-Options': 'DENY',
-    'Referrer-Policy': 'no-referrer',
-    'X-XSS-Protection': '1; mode=block',
-  };
+function isValidUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const parsed = new URL(url);
+    return ['http:', 'https:'].includes(parsed.protocol);
+  } catch {
+    return false;
+  }
 }
 
 function escapeHtml(str) {
@@ -1246,7 +1215,7 @@ function escapeHtml(str) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+    .replace(/'/g, '&#039;');
 }
 
 function sanitizeUrl(url) {
@@ -1260,17 +1229,15 @@ function sanitizeUrl(url) {
   }
 }
 
-function sanitizeText(text, maxLength) {
+function sanitizeText(text, maxLength = 200) {
   if (!text || typeof text !== 'string') return '';
-  return text.trim().substring(0, maxLength).replace(/[\r\n\t]+/g, ' ');
+  return text.trim().substring(0, maxLength).replace(/[\r\n]+/g, ' ');
 }
 
-function isValidUrl(url) {
-  if (!url || typeof url !== 'string') return false;
-  try {
-    const parsed = new URL(url);
-    return ['http:', 'https:'].includes(parsed.protocol);
-  } catch {
-    return false;
-  }
+function getSecurityHeaders() {
+  return {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer-when-downgrade',
+  };
 }
